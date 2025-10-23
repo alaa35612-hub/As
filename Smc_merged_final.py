@@ -22,6 +22,7 @@ parity against the Pine logic.
 from __future__ import annotations
 
 import argparse
+import bisect
 import dataclasses
 import datetime
 import inspect
@@ -714,6 +715,11 @@ class CandleInputs:
 
 
 @dataclass
+class ConsoleInputs:
+    max_age_bars: int = 0
+
+
+@dataclass
 class StructureInputs:
     isOTE: bool = False
     ote1: float = 0.78
@@ -919,6 +925,7 @@ class IndicatorInputs:
     liquidity: LiquidityInputs = field(default_factory=LiquidityInputs)
     order_flow: OrderFlowInputs = field(default_factory=OrderFlowInputs)
     candle: CandleInputs = field(default_factory=CandleInputs)
+    console: ConsoleInputs = field(default_factory=ConsoleInputs)
     structure_util: StructureInputs = field(default_factory=StructureInputs)
     ict_structure: ICTMarketStructureInputs = field(default_factory=ICTMarketStructureInputs)
     key_levels: KeyLevelsInputs = field(default_factory=KeyLevelsInputs)
@@ -1156,6 +1163,15 @@ class SmartMoneyAlgoProE5:
         self.alerts: List[Tuple[int, str]] = []
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
+        console_inputs = getattr(self.inputs, "console", None)
+        if console_inputs is None:
+            max_age = 0
+        else:
+            try:
+                max_age = int(getattr(console_inputs, "max_age_bars", 0) or 0)
+            except (TypeError, ValueError):
+                max_age = 0
+        self.console_max_age_bars = max(0, max_age)
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1268,6 +1284,27 @@ class SmartMoneyAlgoProE5:
 
     def _trace(self, section: str, message: str, *, timestamp: Optional[int], **payload: Any) -> None:
         self.tracer.log(section, message, timestamp=timestamp, **payload)
+
+    def _bars_ago_from_time(self, timestamp: Any) -> Optional[int]:
+        if self.series.length() == 0:
+            return None
+        if not isinstance(timestamp, (int, float)):
+            return None
+        ts = int(timestamp)
+        if ts <= 0:
+            return None
+        idx = bisect.bisect_right(self.series.time, ts) - 1
+        if idx < 0:
+            return self.series.length()
+        return (self.series.length() - 1) - idx
+
+    def _console_event_within_age(self, timestamp: Any) -> bool:
+        if self.console_max_age_bars <= 0:
+            return True
+        bars_ago = self._bars_ago_from_time(timestamp)
+        if bars_ago is None:
+            return True
+        return bars_ago <= self.console_max_age_bars
 
     def gather_console_metrics(self) -> Dict[str, Any]:
         """Aggregate runtime metrics for console presentation."""
@@ -1394,10 +1431,14 @@ class SmartMoneyAlgoProE5:
             )
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
-        events: Dict[str, Dict[str, Any]] = {key: value.copy() for key, value in self.console_event_log.items()}
-        for payload in events.values():
+        events: Dict[str, Dict[str, Any]] = {}
+        for key, value in self.console_event_log.items():
+            payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
+            if not self._console_event_within_age(payload.get("time")):
+                continue
+            events[key] = payload
 
         def record_label(
             key: str,
@@ -1405,6 +1446,10 @@ class SmartMoneyAlgoProE5:
             formatter: Optional[Callable[[Label], str]] = None,
         ) -> None:
             for lbl in reversed(self.labels):
+                if not isinstance(lbl, Label):
+                    continue
+                if not self._console_event_within_age(lbl.x):
+                    continue
                 if predicate(lbl):
                     display = formatter(lbl) if formatter else f"{lbl.text} @ {format_price(lbl.y)}"
                     events[key] = {
@@ -1430,6 +1475,10 @@ class SmartMoneyAlgoProE5:
                 else:
                     seq = list(source)
                 for bx in reversed(seq):
+                    if not isinstance(bx, Box):
+                        continue
+                    if not self._console_event_within_age(bx.left):
+                        continue
                     if predicate(bx):
                         events[key] = {
                             "text": bx.text,
@@ -7764,11 +7813,17 @@ def render_report(
     outfile.write_text(content + "\n")
 
 
-def run_runtime_from_file(source: Path, outfile: Path, timeframe: str = "", bars: int = 0) -> None:
+def run_runtime_from_file(
+    source: Path,
+    outfile: Path,
+    timeframe: str = "",
+    bars: int = 0,
+    inputs: Optional[IndicatorInputs] = None,
+) -> None:
     candles = json.loads(source.read_text())
     if bars > 0:
         candles = candles[-bars:]
-    runtime = SmartMoneyAlgoProE5(base_timeframe=timeframe if timeframe else None)
+    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe if timeframe else None)
     runtime.process(candles)
     triggers = _detect_new_formations_and_touches(runtime, args.timeframe, cfg.formation_lookback)
     if triggers:
@@ -7915,6 +7970,7 @@ def scan_binance(
     tracer: Optional[ExecutionTracer] = None,
     *,
     min_daily_change: float = 0.0,
+    inputs: Optional[IndicatorInputs] = None,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
@@ -7945,7 +8001,7 @@ def scan_binance(
                 )
             continue
         candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(base_timeframe=timeframe, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
         metrics["daily_change_percent"] = daily_change
@@ -7972,7 +8028,7 @@ def scan_binance(
         if primary_runtime is None:
             primary_runtime = runtime
     if primary_runtime is None:
-        primary_runtime = SmartMoneyAlgoProE5(tracer=tracer)
+        primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
         primary_runtime.process([])
     return primary_runtime, summaries
 
@@ -8013,9 +8069,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--trace", action="store_true", help="Enable execution tracing")
     parser.add_argument("--trace-file", type=Path, help="Write execution trace to JSON file")
     parser.add_argument("--compare-trace", type=Path, help="قارن التتبع الحالي بملف JSON مرجعي")
+    parser.add_argument(
+        "--max-age-bars",
+        type=int,
+        default=0,
+        help="Ignore console events older than this many completed bars (0 disables filtering)",
+    )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
+    if args.max_age_bars < 0:
+        parser.error("--max-age-bars يجب أن يكون رقمًا غير سالب")
 
     start = time.time()
 
@@ -8029,12 +8093,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result = tracer.compare(args.compare_trace)
             print_trace_comparison(result)
 
+    indicator_inputs = IndicatorInputs()
+    indicator_inputs.console.max_age_bars = args.max_age_bars
+
     if args.pullback_report:
         log("Foundation")
         pine_text = args.pine_source.read_text(encoding="utf-8")
         python_text = Path(__file__).read_text(encoding="utf-8")
         log("Inventory")
-        runtime = SmartMoneyAlgoProE5(base_timeframe=args.analysis_timeframe or None, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=indicator_inputs,
+            base_timeframe=args.analysis_timeframe or None,
+            tracer=tracer,
+        )
         log("Timeline")
         runtime.process([])
         log("Rendering")
@@ -8051,7 +8122,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.bars > 0:
             candles = candles[-args.bars :]
         log("Inventory")
-        runtime = SmartMoneyAlgoProE5(base_timeframe=args.analysis_timeframe or None, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=indicator_inputs,
+            base_timeframe=args.analysis_timeframe or None,
+            tracer=tracer,
+        )
         log("Timeline")
         runtime.process(candles)
         perform_comparison()
@@ -8064,7 +8139,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.no_scan:
         log("Foundation")
         log("Inventory")
-        runtime = SmartMoneyAlgoProE5(base_timeframe=args.analysis_timeframe or None, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=indicator_inputs,
+            base_timeframe=args.analysis_timeframe or None,
+            tracer=tracer,
+        )
         log("Timeline")
         runtime.process([])
         perform_comparison()
@@ -8085,6 +8164,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.concurrency,
         tracer,
         min_daily_change=args.min_daily_change,
+        inputs=indicator_inputs,
     )
     perform_comparison()
     log("Rendering")

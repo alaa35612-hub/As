@@ -9309,7 +9309,7 @@ def _parse_args_android():
     if args.max_symbols <= 0:
         p.error("--max-symbols must be > 0")
     if args.recent <= 0:
-        p.error("--recent must be > 0")
+        p.error("--recent يجب أن يكون رقمًا موجبًا")
 
     zone_type = args.zone_type
     if args.use_mother_bar:
@@ -9440,7 +9440,13 @@ def _android_cli_entry() -> int:
             runtime.series, latest_events, bars=recent_window
         )
         if not recent_hits:
-            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال آخر {recent_window} شموع")
+            if recent_window == 1:
+                span_phrase = "آخر شمعة واحدة"
+            elif recent_window == 2:
+                span_phrase = "آخر شمعتين"
+            else:
+                span_phrase = f"آخر {recent_window} شموع"
+            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال {span_phrase}")
             continue
 
         recent_alerts = list(getattr(runtime, "alerts", []))

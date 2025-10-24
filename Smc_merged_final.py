@@ -9334,6 +9334,9 @@ def _parse_args_android():
     p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
     args = p.parse_args()
 
+    if args.recent <= 0:
+        p.error("--recent يجب أن يكون رقمًا موجبًا")
+
     zone_type = args.zone_type
     if args.use_mother_bar:
         zone_type = "Mother Bar"
@@ -9403,6 +9406,7 @@ def _android_cli_entry() -> int:
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
     cfg, args = _parse_args_android()
+    recent_window = max(1, args.recent)
 
     symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
     symbols = list(dict.fromkeys(symbols))
@@ -9439,6 +9443,11 @@ def _android_cli_entry() -> int:
         fvg=fvg, liquidity=liq, demand_supply=ds, order_block=ob,
         structure_util=utils, ict_structure=ict,
     )
+    if getattr(inputs, "console", None) is not None:
+        try:
+            inputs.console.max_age_bars = max(1, recent_window - 1)
+        except Exception:
+            inputs.console.max_age_bars = 1
 
     alerts_total = 0
     for i, sym in enumerate(symbols, 1):
@@ -9457,16 +9466,22 @@ def _android_cli_entry() -> int:
         metrics = runtime.gather_console_metrics()
         latest_events = metrics.get("latest_events") or {}
         recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=2
+            runtime.series, latest_events, bars=recent_window
         )
         if not recent_hits:
-            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال آخر شمعتين")
+            if recent_window == 1:
+                span_phrase = "آخر شمعة واحدة"
+            elif recent_window == 2:
+                span_phrase = "آخر شمعتين"
+            else:
+                span_phrase = f"آخر {recent_window} شموع"
+            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال {span_phrase}")
             continue
 
         recent_alerts = list(getattr(runtime, "alerts", []))
-        if args.recent > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
+        if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
             try:
-                cutoff_idx = max(0, runtime.series.length() - args.recent)
+                cutoff_idx = max(0, runtime.series.length() - recent_window)
                 cutoff_time = runtime.series.get_time(cutoff_idx)
                 if cutoff_time:
                     recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]

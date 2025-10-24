@@ -1156,6 +1156,14 @@ class SmartMoneyAlgoProE5:
         self.alerts: List[Tuple[int, str]] = []
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
+        self.golden_zone_new_total = 0
+        self.golden_zone_touched_total = 0
+        self.golden_zone_retest_total = 0
+        self.bxf_touch_count = 0
+        self.bxf_touch_active = False
+        self.bxf_last_status: Optional[str] = None
+        self.bxf_direction: Optional[str] = None
+        self.bxf_creation_time: Optional[int] = None
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1323,6 +1331,7 @@ class SmartMoneyAlgoProE5:
         }
         metrics["current_price"] = self.series.get("close")
         metrics["latest_events"] = self._collect_latest_console_events()
+        metrics["golden_zone"] = self._gather_golden_zone_metrics()
         return metrics
 
     def _register_label_event(self, label: Label) -> None:
@@ -1362,7 +1371,14 @@ class SmartMoneyAlgoProE5:
             }
             self._trace("label", "register", timestamp=label.x, key=key, text=label.text, price=label.y)
 
-    def _register_box_event(self, box: Box) -> None:
+    def _register_box_event(
+        self,
+        box: Box,
+        *,
+        status: Optional[str] = None,
+        event_time: Optional[int] = None,
+        direction: Optional[str] = None,
+    ) -> None:
         text = box.text.strip()
         key: Optional[str] = None
         if text == "IDM OB":
@@ -1376,21 +1392,47 @@ class SmartMoneyAlgoProE5:
         elif text == "Golden zone":
             key = "GOLDEN_ZONE"
         if key:
-            self.console_event_log[key] = {
+            timestamp = event_time if event_time is not None else box.right
+            direction_tag = None
+            if direction:
+                low_dir = direction.lower()
+                if low_dir in ("bull", "bullish"):
+                    direction_tag = "[Bull]"
+                elif low_dir in ("bear", "bearish"):
+                    direction_tag = "[Bear]"
+                else:
+                    direction_tag = f"[{direction}]"
+            base_display = f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}"
+            if direction_tag:
+                base_display = f"{direction_tag} {base_display}"
+            display = f"{base_display} ({status})" if status else base_display
+            payload: Dict[str, Any] = {
                 "text": box.text,
                 "price": (box.bottom, box.top),
-                "time": box.left,
-                "time_display": format_timestamp(box.left),
-                "display": f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}",
+                "time": timestamp,
+                "ts": timestamp,
+                "time_display": format_timestamp(timestamp),
+                "display": display,
             }
+            if status:
+                payload["status"] = status
+            if direction_tag:
+                payload["direction_tag"] = direction_tag
+            if direction:
+                payload["direction"] = direction
+            self.console_event_log[key] = payload
+            if key == "GOLDEN_ZONE" and status:
+                status_key = f"GOLDEN_ZONE_{status.upper()}"
+                self.console_event_log[status_key] = payload.copy()
             self._trace(
                 "box",
                 "register",
-                timestamp=box.right,
+                timestamp=timestamp,
                 key=key,
                 text=box.text,
                 top=box.top,
                 bottom=box.bottom,
+                status=status,
             )
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
@@ -1495,6 +1537,80 @@ class SmartMoneyAlgoProE5:
         record_box("GOLDEN_ZONE", lambda bx: bx.text == "Golden zone")
 
         return events
+
+    def _gather_golden_zone_metrics(self) -> Dict[str, Any]:
+        metrics: Dict[str, Any] = {
+            "new_total": self.golden_zone_new_total,
+            "touched_total": self.golden_zone_touched_total,
+            "retest_total": self.golden_zone_retest_total,
+            "status": self.bxf_last_status,
+            "active": False,
+        }
+        entry = self.console_event_log.get("GOLDEN_ZONE")
+        if entry:
+            metrics.update(
+                {
+                    "display": entry.get("display"),
+                    "direction": entry.get("direction"),
+                    "direction_tag": entry.get("direction_tag"),
+                    "price": entry.get("price"),
+                    "time": entry.get("time"),
+                    "ts": entry.get("ts"),
+                }
+            )
+        if self.bxf is not None:
+            metrics["active"] = True
+            metrics["top"] = self.bxf.top
+            metrics["bottom"] = self.bxf.bottom
+            metrics.setdefault("price", (self.bxf.bottom, self.bxf.top))
+            metrics["range_display"] = f"{format_price(self.bxf.bottom)} → {format_price(self.bxf.top)}"
+            if self.bxf_direction and "direction" not in metrics:
+                metrics["direction"] = self.bxf_direction
+            if "direction_tag" not in metrics or metrics.get("direction_tag") is None:
+                if self.bxf_direction == "bullish":
+                    metrics["direction_tag"] = "[Bull]"
+                elif self.bxf_direction == "bearish":
+                    metrics["direction_tag"] = "[Bear]"
+        return metrics
+
+    def _reset_golden_zone_runtime(self) -> None:
+        self.bxf_touch_count = 0
+        self.bxf_touch_active = False
+        self.bxf_last_status = None
+        self.bxf_direction = None
+        self.bxf_creation_time = None
+        self.console_event_log.pop("GOLDEN_ZONE", None)
+        self.console_event_log.pop("GOLDEN_ZONE_NEW", None)
+        self.console_event_log.pop("GOLDEN_ZONE_TOUCHED", None)
+        self.console_event_log.pop("GOLDEN_ZONE_RETEST", None)
+
+    def _update_golden_zone_touch_state(self, high: float, low: float, time_val: int) -> None:
+        if self.bxf is None:
+            self.bxf_touch_active = False
+            return
+        if self.bxf_creation_time is not None and time_val <= self.bxf_creation_time:
+            return
+        top = self.bxf.top
+        bottom = self.bxf.bottom
+        in_zone = (low <= top and high >= bottom)
+        if not in_zone:
+            self.bxf_touch_active = False
+            return
+        if self.bxf_touch_active:
+            return
+        self.bxf_touch_active = True
+        self.bxf_touch_count += 1
+        status = "touched" if self.bxf_touch_count == 1 else "retest"
+        if status == "touched":
+            self.golden_zone_touched_total += 1
+        else:
+            self.golden_zone_retest_total += 1
+        direction = self.bxf_direction
+        if not direction:
+            direction = "bullish" if self.bxty > 0 else "bearish"
+            self.bxf_direction = direction
+        self.bxf_last_status = status
+        self._register_box_event(self.bxf, status=status, event_time=time_val, direction=direction)
 
     def _sync_state_mirrors(self) -> None:
         """Mirror Pine ``var``/``array`` structures into dedicated containers."""
@@ -6896,14 +7012,26 @@ class SmartMoneyAlgoProE5:
             if oi1 is not None:
                 if self.bxf and self.bxf in self.boxes:
                     self.boxes.remove(self.bxf)
+                self._reset_golden_zone_runtime()
                 top_val = ot if not math.isnan(ot) else self.series.get("high")
                 bot_val = ob if not math.isnan(ob) else self.series.get("low")
                 self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
                 self.bxf.set_text("Golden zone")
                 self.bxf.set_text_color(self.inputs.structure_util.oteclr)
-                self._register_box_event(self.bxf)
                 self.bxty = 1 if dir_up else -1
+                self.bxf_direction = "bullish" if self.bxty == 1 else "bearish"
+                self.golden_zone_new_total += 1
+                self.bxf_last_status = "new"
+                self.bxf_creation_time = time_val
+                self._register_box_event(
+                    self.bxf,
+                    status="new",
+                    event_time=time_val,
+                    direction=self.bxf_direction,
+                )
                 self.prev_oi1 = float(oi1)
+
+        self._update_golden_zone_touch_state(high, low, time_val)
 
         self._sync_state_mirrors()
 
@@ -8371,6 +8499,8 @@ _LAST_BUCKETS = {
     "BOS": ["bos", "b 0 s"],
     "CHOCH": ["choch", "ch o ch"],
     "Golden zone": ["golden zone"],
+    "Golden zone touched": ["golden zone (touched)", "golden zone touched"],
+    "Golden zone retest": ["golden zone (retest)", "golden zone retest"],
     "IDM": ["idm @", " i d m "],
     "EXT OB": ["ext ob", "ext_ob", "ext  ob"],
     "IDM OB": ["idm ob"],
@@ -8384,6 +8514,8 @@ _METRIC_MAP = {
     "BOS": ["BOS", "bos"],
     "CHOCH": ["CHOCH", "choch"],
     "Golden zone": ["GOLDEN_ZONE", "golden_zone", "GZ"],
+    "Golden zone touched": ["GOLDEN_ZONE_TOUCHED"],
+    "Golden zone retest": ["GOLDEN_ZONE_RETEST"],
     "IDM": ["IDM", "idm"],
     "EXT OB": ["EXT_OB", "ext_ob", "EXT-OB"],
     "IDM OB": ["IDM_OB", "idm_ob"],
@@ -8511,6 +8643,12 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         pass
     pct = _fetch_pct_change(exchange, symbol)
     pct_s = f"{pct:+.2f}%" if pct is not None else "—"
+    metrics = {}
+    if hasattr(runtime, "gather_console_metrics"):
+        try:
+            metrics = runtime.gather_console_metrics() or {}
+        except Exception:
+            metrics = {}
 
     hdr = f"{symbol} ({timeframe}) تحليل"
     print(f"\n===== {hdr} =====")
@@ -8531,6 +8669,78 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("صناديق Order Flow:", c("OF_BOX"))
     print("مستويات السيولة :", c("LIQ"))
     print("شموع SCOB       :", c("SCOB"))
+
+    gz = metrics.get("golden_zone", {}) if isinstance(metrics, dict) else {}
+    if isinstance(gz, dict) and (
+        gz.get("new_total")
+        or gz.get("touched_total")
+        or gz.get("retest_total")
+        or gz.get("display")
+    ):
+        direction_tag = gz.get("direction_tag") or ""
+        range_display = gz.get("range_display")
+        if not range_display:
+            price = gz.get("price")
+            if isinstance(price, (list, tuple)) and len(price) == 2:
+                range_display = f"{format_price(price[0])} → {format_price(price[1])}"
+        status_display = gz.get("status") or gz.get("display") or "—"
+        print("\nمنطقة Golden zone :", direction_tag, range_display or "—", "| الحالة:", status_display)
+        print(
+            "  إجمالي → جديدة:",
+            gz.get("new_total", 0),
+            "| لمس:",
+            gz.get("touched_total", 0),
+            "| إعادة اختبار:",
+            gz.get("retest_total", 0),
+        )
+
+    gz = metrics.get("golden_zone", {}) if isinstance(metrics, dict) else {}
+    if isinstance(gz, dict) and (
+        gz.get("new_total")
+        or gz.get("touched_total")
+        or gz.get("retest_total")
+        or gz.get("display")
+    ):
+        direction_tag = gz.get("direction_tag") or ""
+        range_display = gz.get("range_display")
+        if not range_display:
+            price = gz.get("price")
+            if isinstance(price, (list, tuple)) and len(price) == 2:
+                range_display = f"{format_price(price[0])} → {format_price(price[1])}"
+        status_display = gz.get("status") or gz.get("display") or "—"
+        print("\nمنطقة Golden zone :", direction_tag, range_display or "—", "| الحالة:", status_display)
+        print(
+            "  إجمالي → جديدة:",
+            gz.get("new_total", 0),
+            "| لمس:",
+            gz.get("touched_total", 0),
+            "| إعادة اختبار:",
+            gz.get("retest_total", 0),
+        )
+
+    gz = metrics.get("golden_zone", {}) if isinstance(metrics, dict) else {}
+    if isinstance(gz, dict) and (
+        gz.get("new_total")
+        or gz.get("touched_total")
+        or gz.get("retest_total")
+        or gz.get("display")
+    ):
+        direction_tag = gz.get("direction_tag") or ""
+        range_display = gz.get("range_display")
+        if not range_display:
+            price = gz.get("price")
+            if isinstance(price, (list, tuple)) and len(price) == 2:
+                range_display = f"{format_price(price[0])} → {format_price(price[1])}"
+        status_display = gz.get("status") or gz.get("display") or "—"
+        print("\nمنطقة Golden zone :", direction_tag, range_display or "—", "| الحالة:", status_display)
+        print(
+            "  إجمالي → جديدة:",
+            gz.get("new_total", 0),
+            "| لمس:",
+            gz.get("touched_total", 0),
+            "| إعادة اختبار:",
+            gz.get("retest_total", 0),
+        )
 
     print("\nأحدث الإشارات مع الأسعار")
     if not recent_alerts:
@@ -8623,10 +8833,22 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
 
         latest = runtime.gather_console_metrics().get("latest_events", {})
-        summary = []
-        for key in ["BOS","BOS_PLUS","CHOCH","IDM","IDM_OB","EXT_OB","GOLDEN_ZONE"]:
+        summary: List[str] = []
+        for key in [
+            "BOS",
+            "BOS_PLUS",
+            "CHOCH",
+            "IDM",
+            "IDM_OB",
+            "EXT_OB",
+            "GOLDEN_ZONE",
+            "GOLDEN_ZONE_TOUCHED",
+            "GOLDEN_ZONE_RETEST",
+        ]:
             if key in latest:
-                summary.append(latest[key]["display"])
+                display = latest[key].get("display") if isinstance(latest[key], dict) else str(latest[key])
+                if display not in summary:
+                    summary.append(display)
 
         if recent_alerts or args.verbose:
             _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
@@ -8802,6 +9024,8 @@ _LAST_BUCKETS = {
     "BOS": ["bos","b 0 s"],
     "CHOCH": ["choch","ch o ch"],
     "Golden zone": ["golden zone","gz"],
+    "Golden zone touched": ["golden zone (touched)","golden zone touched"],
+    "Golden zone retest": ["golden zone (retest)","golden zone retest"],
     "IDM": ["idm"," i d m "],
     "EXT OB": ["ext ob","ext_ob"],
     "IDM OB": ["idm ob","idm_ob"],
@@ -8855,6 +9079,8 @@ _METRIC_MAP = {
     "BOS": ["BOS","bos","b 0 s"],
     "CHOCH": ["CHOCH","choch","ch o ch"],
     "Golden zone": ["GOLDEN_ZONE","golden_zone","gz","golden zone"],
+    "Golden zone touched": ["GOLDEN_ZONE_TOUCHED"],
+    "Golden zone retest": ["GOLDEN_ZONE_RETEST"],
     "IDM": ["IDM","idm"," i d m "],
     "EXT OB": ["EXT_OB","ext_ob","ext ob"],
     "IDM OB": ["IDM_OB","idm_ob","idm ob"],
@@ -8934,6 +9160,13 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print(f"\\n===== {hdr} =====")
     print(f"عدد الشموع: {ln}  |  السعر الحالي: {_ar_num(last_close) if last_close is not None else '—'}  |  تغيّر 24 ساعة: {pct_s}")
 
+    metrics = {}
+    if hasattr(runtime, "gather_console_metrics"):
+        try:
+            metrics = runtime.gather_console_metrics() or {}
+        except Exception:
+            metrics = {}
+
     # عدادات (من نصوص التنبيهات فقط)
     def _count_by_keywords(alerts):
         out = {k: 0 for k in _AR_KEYS}
@@ -8957,6 +9190,54 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("صناديق Order Flow:", c("OF_BOX"))
     print("مستويات السيولة :", c("LIQ"))
     print("شموع SCOB       :", c("SCOB"))
+
+    gz = metrics.get("golden_zone", {}) if isinstance(metrics, dict) else {}
+    if isinstance(gz, dict) and (
+        gz.get("new_total")
+        or gz.get("touched_total")
+        or gz.get("retest_total")
+        or gz.get("display")
+    ):
+        direction_tag = gz.get("direction_tag") or ""
+        range_display = gz.get("range_display")
+        if not range_display:
+            price = gz.get("price")
+            if isinstance(price, (list, tuple)) and len(price) == 2:
+                range_display = f"{format_price(price[0])} → {format_price(price[1])}"
+        status_display = gz.get("status") or gz.get("display") or "—"
+        print("\nمنطقة Golden zone :", direction_tag, range_display or "—", "| الحالة:", status_display)
+        print(
+            "  إجمالي → جديدة:",
+            gz.get("new_total", 0),
+            "| لمس:",
+            gz.get("touched_total", 0),
+            "| إعادة اختبار:",
+            gz.get("retest_total", 0),
+        )
+
+    gz = metrics.get("golden_zone", {}) if isinstance(metrics, dict) else {}
+    if isinstance(gz, dict) and (
+        gz.get("new_total")
+        or gz.get("touched_total")
+        or gz.get("retest_total")
+        or gz.get("display")
+    ):
+        direction_tag = gz.get("direction_tag") or ""
+        range_display = gz.get("range_display")
+        if not range_display:
+            price = gz.get("price")
+            if isinstance(price, (list, tuple)) and len(price) == 2:
+                range_display = f"{format_price(price[0])} → {format_price(price[1])}"
+        status_display = gz.get("status") or gz.get("display") or "—"
+        print("\nمنطقة Golden zone :", direction_tag, range_display or "—", "| الحالة:", status_display)
+        print(
+            "  إجمالي → جديدة:",
+            gz.get("new_total", 0),
+            "| لمس:",
+            gz.get("touched_total", 0),
+            "| إعادة اختبار:",
+            gz.get("retest_total", 0),
+        )
 
     print("\\nأحدث الإشارات مع الأسعار")
     latest = _extract_latest_from_runtime(runtime)

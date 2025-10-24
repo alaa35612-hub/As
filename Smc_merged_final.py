@@ -8059,6 +8059,42 @@ def scan_binance(
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
+
+        recent_times: List[int] = []
+        for offset in (0, 1):
+            ts = runtime.series.get_time(offset)
+            if isinstance(ts, (int, float)) and ts > 0:
+                recent_times.append(int(ts))
+
+        latest_events = metrics.get("latest_events") or {}
+
+        def _event_within_recent_window(payload: Dict[str, Any]) -> bool:
+            timestamp = payload.get("time") if isinstance(payload, dict) else None
+            if not isinstance(timestamp, (int, float)):
+                return False
+            return int(timestamp) in recent_times
+
+        recent_hits = [
+            key for key, payload in latest_events.items() if _event_within_recent_window(payload)
+        ]
+        if recent_hits:
+            joined = ", ".join(recent_hits)
+            print(
+                f"تخطي {symbol} بسبب أحداث خلال آخر شمعتين: {joined}",
+                flush=True,
+            )
+            if tracer and tracer.enabled:
+                tracer.log(
+                    "scan",
+                    "symbol_skipped_recent_event",
+                    timestamp=runtime.series.get_time(0) or None,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    events=recent_hits,
+                    reference_times=recent_times,
+                )
+            continue
+
         metrics["daily_change_percent"] = daily_change
         summaries.append(
             {

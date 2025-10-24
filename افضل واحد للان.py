@@ -57,6 +57,36 @@ ANSI_DIM = "\033[2m"
 ANSI_LABEL = "\033[94m"
 ANSI_VALUE_POS = "\033[92m"
 ANSI_VALUE_ZERO = "\033[93m"
+ANSI_VALUE_NEG = "\033[91m"
+ANSI_SYMBOL = ANSI_VALUE_POS
+ANSI_ALERT_BULL = ANSI_VALUE_POS
+ANSI_ALERT_BEAR = ANSI_VALUE_NEG
+
+ALERT_BULLISH_KEYWORDS = (
+    "bull",
+    "bullish",
+    "long",
+    "buy",
+    "up",
+    "صاعد",
+    "صعود",
+    "صاعدة",
+    "ارتفاع",
+    "شراء",
+)
+
+ALERT_BEARISH_KEYWORDS = (
+    "bear",
+    "bearish",
+    "short",
+    "sell",
+    "down",
+    "هابط",
+    "هابطة",
+    "هبوط",
+    "انخفاض",
+    "بيع",
+)
 ANSI_HEADER_COLORS = [
     "\033[95m",
     "\033[96m",
@@ -64,6 +94,90 @@ ANSI_HEADER_COLORS = [
     "\033[93m",
     "\033[94m",
 ]
+
+
+def _normalize_direction(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if not token:
+            return None
+        if token in {
+            "bull",
+            "bullish",
+            "up",
+            "long",
+            "buy",
+            "صاعد",
+            "صعود",
+            "صاعدة",
+            "ارتفاع",
+            "شراء",
+        }:
+            return "bullish"
+        if token in {
+            "bear",
+            "bearish",
+            "down",
+            "short",
+            "sell",
+            "هابط",
+            "هبوط",
+            "هابطة",
+            "انخفاض",
+            "بيع",
+        }:
+            return "bearish"
+    return None
+
+
+def _infer_direction_from_text(text: Optional[str]) -> Optional[str]:
+    if not isinstance(text, str):
+        return None
+    lowered = text.lower()
+    if any(keyword in lowered for keyword in ALERT_BEARISH_KEYWORDS):
+        return "bearish"
+    if any(keyword in lowered for keyword in ALERT_BULLISH_KEYWORDS):
+        return "bullish"
+    return None
+
+
+def _resolve_direction(*values: Any) -> Optional[str]:
+    for value in values:
+        direction = _normalize_direction(value)
+        if direction:
+            return direction
+        if isinstance(value, str):
+            inferred = _infer_direction_from_text(value)
+            if inferred:
+                return inferred
+    return None
+
+
+def _color_for_direction(direction: Optional[str], *, fallback: Optional[str] = None) -> Optional[str]:
+    norm = _normalize_direction(direction) if direction else None
+    if norm == "bullish":
+        return ANSI_ALERT_BULL
+    if norm == "bearish":
+        return ANSI_ALERT_BEAR
+    return fallback
+
+
+def _colorize_directional_text(
+    text: Any,
+    *,
+    direction: Optional[str] = None,
+    fallback: Optional[str] = None,
+) -> str:
+    base = str(text) if text is not None else ""
+    resolved = _resolve_direction(direction, base)
+    color = _color_for_direction(resolved, fallback=fallback)
+    if color:
+        return f"{color}{base}{ANSI_RESET}"
+    return base
+
+
+def _format_symbol(symbol: str) -> str:
+    return f"{ANSI_SYMBOL}{symbol}{ANSI_RESET}"
 
 
 @dataclass
@@ -7951,8 +8065,9 @@ EVENT_DISPLAY_ORDER = [
 
 def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: int, metrics: Dict[str, Any]) -> None:
     header_color = ANSI_HEADER_COLORS[index % len(ANSI_HEADER_COLORS)]
+    symbol_display = _format_symbol(symbol)
     header_lines = [
-        f"{header_color}{ANSI_BOLD}════ تحليل {symbol} ({timeframe}) ════{ANSI_RESET}",
+        f"{header_color}{ANSI_BOLD}════ تحليل {symbol_display}{header_color}{ANSI_BOLD} ({timeframe}) ════{ANSI_RESET}",
         f"{ANSI_DIM}عدد الشموع: {candle_count}{ANSI_RESET}",
     ]
     price_value = metrics.get("current_price")
@@ -7994,12 +8109,22 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
             time_display = event.get("time_display") or format_timestamp(event.get("time"))
             if time_display and time_display != "—":
                 display_text = f"{display_text} | {time_display}"
-            value_color = ANSI_VALUE_POS
+            direction_hint = _resolve_direction(
+                event.get("direction"),
+                event.get("direction_display"),
+                event.get("status"),
+                event.get("text"),
+                display_text,
+            )
+            colored_display = _colorize_directional_text(
+                display_text,
+                direction=direction_hint,
+                fallback=ANSI_VALUE_POS,
+            )
         else:
-            display_text = "—"
-            value_color = ANSI_VALUE_ZERO
+            colored_display = _colorize_directional_text("—", direction=None, fallback=ANSI_VALUE_ZERO)
         print(
-            f"  {ANSI_LABEL}{label:<26}{ANSI_RESET}: {value_color}{display_text}{ANSI_RESET}",
+            f"  {ANSI_LABEL}{label:<26}{ANSI_RESET}: {colored_display}",
             flush=True,
         )
     print(f"{ANSI_DIM}{'-'*48}{ANSI_RESET}", flush=True)
@@ -8110,12 +8235,16 @@ def scan_binance(
         try:
             ticker = exchange.fetch_ticker(symbol)
         except Exception as exc:
-            print(f"تخطي {symbol} بسبب فشل fetch_ticker: {exc}", file=sys.stderr, flush=True)
+            print(
+                f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
             continue
         daily_change = _extract_daily_change_percent(ticker)
         if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
             print(
-                f"تخطي {symbol} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
+                f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
                 flush=True,
             )
             if tracer and tracer.enabled:
@@ -8138,7 +8267,7 @@ def scan_binance(
         )
         if not recent_hits:
             print(
-                f"تخطي {symbol} لعدم وجود أحداث خلال آخر {window} شموع",
+                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
                 flush=True,
             )
             if tracer and tracer.enabled:
@@ -8753,7 +8882,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     pct = _fetch_pct_change(exchange, symbol)
     pct_s = f"{pct:+.2f}%" if pct is not None else "—"
 
-    hdr = f"{symbol} ({timeframe}) تحليل"
+    hdr = f"{_format_symbol(symbol)} ({timeframe}) تحليل"
     print(f"\n===== {hdr} =====")
     print(f"عدد الشموع: {ln}  |  السعر الحالي: {_ar_num(last_close) if last_close is not None else '—'}  |  تغيّر 24 ساعة: {pct_s}")
 
@@ -8807,7 +8936,8 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
             except Exception:
                 ts_s = "—"
-            print(f"- {name}: {ts_s} UTC  |  {title}")
+            colored_title = _colorize_directional_text(title)
+            print(f"- {name}: {ts_s} UTC  |  {colored_title}")
     if ccxt is None:
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
@@ -8874,7 +9004,10 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             runtime.process(candles)
         except Exception as e:
             if args.debug:
-                print(f"[{i}/{len(symbols)}] {sym}: error {e}", file=sys.stderr)
+                print(
+                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
+                    file=sys.stderr,
+                )
             continue
 
         metrics = runtime.gather_console_metrics()
@@ -8883,7 +9016,9 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             runtime.series, latest, bars=recent_window
         )
         if not recent_hits:
-            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال آخر {recent_window} شموع")
+            print(
+                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
+            )
             continue
 
         recent_alerts = list(runtime.alerts)
@@ -8900,7 +9035,20 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 status_disp = evt.get("status_display")
                 if status_disp:
                     disp = f"{disp} [{status_disp}]"
-                summary.append(disp)
+                direction_hint = _resolve_direction(
+                    evt.get("direction"),
+                    evt.get("direction_display"),
+                    evt.get("status"),
+                    evt.get("text"),
+                    disp,
+                )
+                summary.append(
+                    _colorize_directional_text(
+                        disp,
+                        direction=direction_hint,
+                        fallback=None,
+                    )
+                )
 
         if recent_alerts or args.verbose:
             _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
@@ -8908,7 +9056,8 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 print("  •", " | ".join(summary))
             for ts, title in recent_alerts[-10:]:
                 ts_s = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts/1000))
-                print(f"  - {ts_s} :: {title}")
+                colored_title = _colorize_directional_text(title)
+                print(f"  - {ts_s} :: {colored_title}")
             alerts_total += len(recent_alerts)
 
     if args.verbose:
@@ -8983,7 +9132,10 @@ def _android_cli_entry() -> int:
             runtime.process(candles)
         except Exception as e:
             if args.debug:
-                print(f"[{i}/{len(symbols)}] {sym}: error {e}", file=sys.stderr)
+                print(
+                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
+                    file=sys.stderr,
+                )
             continue
 
         metrics = runtime.gather_console_metrics()
@@ -8992,7 +9144,9 @@ def _android_cli_entry() -> int:
             runtime.series, latest_events, bars=recent_window
         )
         if not recent_hits:
-            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال آخر {recent_window} شموع")
+            print(
+                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
+            )
             continue
 
         recent_alerts = list(runtime.alerts)
@@ -9213,8 +9367,8 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     pct = _fetch_pct_change(exchange, symbol)
     pct_s = f"{pct:+.2f}%" if pct is not None else "—"
 
-    disp_sym = symbol.replace(":USDT","")
-    hdr = f"{disp_sym} ({timeframe}) تحليل"
+    disp_sym = symbol.replace(':USDT','')
+    hdr = f"{_format_symbol(disp_sym)} ({timeframe}) تحليل"
     print(f"\\n===== {hdr} =====")
     print(f"عدد الشموع: {ln}  |  السعر الحالي: {_ar_num(last_close) if last_close is not None else '—'}  |  تغيّر 24 ساعة: {pct_s}")
 
@@ -9274,7 +9428,8 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
             except Exception:
                 ts_s = "—"
-            print(f"- {name}: {ts_s} UTC  |  {title}")
+            colored_title = _colorize_directional_text(title)
+            print(f"- {name}: {ts_s} UTC  |  {colored_title}")
 
 # ---------- Live exchange helpers (Futures-only) ----------
 def _build_exchange(_market_forced_usdtm:str="usdtm"):
@@ -9493,7 +9648,10 @@ def _android_cli_entry() -> int:
             runtime._strict_close_for_break = cfg.strict_close_for_break
             runtime.process([{"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')} for c in candles])
         except Exception as e:
-            print(f"[{i}/{len(symbols)}] {sym}: error {e}", file=sys.stderr)
+            print(
+                f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
+                file=sys.stderr,
+            )
             continue
 
         metrics = runtime.gather_console_metrics()
@@ -9508,7 +9666,9 @@ def _android_cli_entry() -> int:
                 span_phrase = "آخر شمعتين"
             else:
                 span_phrase = f"آخر {recent_window} شموع"
-            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال {span_phrase}")
+            print(
+                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
+            )
             continue
 
         recent_alerts = list(getattr(runtime, "alerts", []))

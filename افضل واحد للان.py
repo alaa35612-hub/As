@@ -716,7 +716,7 @@ class CandleInputs:
 
 @dataclass
 class ConsoleInputs:
-    max_age_bars: int = 0
+    max_age_bars: int = 1
 
 
 @dataclass
@@ -1165,13 +1165,13 @@ class SmartMoneyAlgoProE5:
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
-            max_age = 0
+            max_age = 1
         else:
             try:
-                max_age = int(getattr(console_inputs, "max_age_bars", 0) or 0)
+                max_age = int(getattr(console_inputs, "max_age_bars", 1) or 1)
             except (TypeError, ValueError):
-                max_age = 0
-        self.console_max_age_bars = max(0, max_age)
+                max_age = 1
+        self.console_max_age_bars = max(1, max_age)
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -8097,20 +8097,18 @@ def scan_binance(
         recent_hits, recent_times = _collect_recent_event_hits(
             runtime.series, latest_events, bars=2
         )
-        if recent_hits:
-            joined = ", ".join(recent_hits)
+        if not recent_hits:
             print(
-                f"تخطي {symbol} بسبب أحداث خلال آخر شمعتين: {joined}",
+                f"تخطي {symbol} لعدم وجود أحداث خلال آخر شمعتين",
                 flush=True,
             )
             if tracer and tracer.enabled:
                 tracer.log(
                     "scan",
-                    "symbol_skipped_recent_event",
+                    "symbol_skipped_stale_events",
                     timestamp=runtime.series.get_time(0) or None,
                     symbol=symbol,
                     timeframe=timeframe,
-                    events=recent_hits,
                     reference_times=recent_times,
                 )
             continue
@@ -8183,14 +8181,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--max-age-bars",
         type=int,
-        default=0,
-        help="Ignore console events older than this many completed bars (0 disables filtering)",
+        default=1,
+        help="Ignore console events older than this many completed bars (minimum 1)",
     )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
-    if args.max_age_bars < 0:
-        parser.error("--max-age-bars يجب أن يكون رقمًا غير سالب")
+    if args.max_age_bars <= 0:
+        parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
 
     start = time.time()
 
@@ -8484,7 +8482,7 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--exclude-patterns", default=_DEFAULT_EXCLUDE_PATTERNS)
     p.add_argument("--include-only", default="")
     # misc
-    p.add_argument("--recent", type=int, default=5)
+    p.add_argument("--recent", type=int, default=2)
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--tg", action="store_true", default=False)
@@ -8812,9 +8810,8 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         recent_hits, recent_times = _collect_recent_event_hits(
             runtime.series, latest, bars=2
         )
-        if recent_hits:
-            joined = ", ".join(recent_hits)
-            print(f"[{i}/{len(symbols)}] تخطي {sym} بسبب أحداث خلال آخر شمعتين: {joined}")
+        if not recent_hits:
+            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال آخر شمعتين")
             continue
 
         recent_alerts = list(runtime.alerts)
@@ -8921,9 +8918,8 @@ def _android_cli_entry() -> int:
         recent_hits, recent_times = _collect_recent_event_hits(
             runtime.series, latest_events, bars=2
         )
-        if recent_hits:
-            joined = ", ".join(recent_hits)
-            print(f"[{i}/{len(symbols)}] تخطي {sym} بسبب أحداث خلال آخر شمعتين: {joined}")
+        if not recent_hits:
+            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال آخر شمعتين")
             continue
 
         recent_alerts = list(runtime.alerts)
@@ -9242,7 +9238,7 @@ def _parse_args_android():
     p.add_argument("--tg", action="store_true", default=False)
     p.add_argument("--symbol", "-s", default="")
     p.add_argument("--verbose", "-v", action="store_true", default=False)
-    p.add_argument("--recent", type=int, default=5)
+    p.add_argument("--recent", type=int, default=2)
     p.add_argument("--drop-last", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--show-hl", action="store_true", default=False)
@@ -9403,9 +9399,8 @@ def _android_cli_entry() -> int:
         recent_hits, recent_times = _collect_recent_event_hits(
             runtime.series, latest_events, bars=2
         )
-        if recent_hits:
-            joined = ", ".join(recent_hits)
-            print(f"[{i}/{len(symbols)}] تخطي {sym} بسبب أحداث خلال آخر شمعتين: {joined}")
+        if not recent_hits:
+            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال آخر شمعتين")
             continue
 
         recent_alerts = list(getattr(runtime, "alerts", []))

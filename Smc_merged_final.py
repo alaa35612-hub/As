@@ -8017,6 +8017,40 @@ def _extract_daily_change_percent(ticker: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+def _collect_recent_event_hits(
+    series: Any,
+    latest_events: Any,
+    *,
+    bars: int = 2,
+) -> Tuple[List[str], List[int]]:
+    """Identify latest-event keys that fall within the most recent candles."""
+
+    if bars <= 0:
+        return [], []
+
+    recent_times: List[int] = []
+    if hasattr(series, "get_time"):
+        for offset in range(bars):
+            try:
+                ts = series.get_time(offset)
+            except Exception:
+                ts = None
+            if isinstance(ts, (int, float)) and ts > 0:
+                recent_times.append(int(ts))
+
+    if not recent_times or not isinstance(latest_events, dict):
+        return [], recent_times
+
+    hits: List[str] = []
+    for key, payload in latest_events.items():
+        timestamp: Optional[Union[int, float]] = None
+        if isinstance(payload, dict):
+            timestamp = payload.get("time") or payload.get("ts") or payload.get("timestamp")
+        if isinstance(timestamp, (int, float)) and int(timestamp) in recent_times:
+            hits.append(str(key))
+    return hits, recent_times
+
+
 def scan_binance(
     timeframe: str,
     limit: int,
@@ -8059,24 +8093,10 @@ def scan_binance(
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
-
-        recent_times: List[int] = []
-        for offset in (0, 1):
-            ts = runtime.series.get_time(offset)
-            if isinstance(ts, (int, float)) and ts > 0:
-                recent_times.append(int(ts))
-
         latest_events = metrics.get("latest_events") or {}
-
-        def _event_within_recent_window(payload: Dict[str, Any]) -> bool:
-            timestamp = payload.get("time") if isinstance(payload, dict) else None
-            if not isinstance(timestamp, (int, float)):
-                return False
-            return int(timestamp) in recent_times
-
-        recent_hits = [
-            key for key, payload in latest_events.items() if _event_within_recent_window(payload)
-        ]
+        recent_hits, recent_times = _collect_recent_event_hits(
+            runtime.series, latest_events, bars=2
+        )
         if recent_hits:
             joined = ", ".join(recent_hits)
             print(
@@ -8787,13 +8807,22 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 print(f"[{i}/{len(symbols)}] {sym}: error {e}", file=sys.stderr)
             continue
 
+        metrics = runtime.gather_console_metrics()
+        latest = metrics.get("latest_events", {})
+        recent_hits, recent_times = _collect_recent_event_hits(
+            runtime.series, latest, bars=2
+        )
+        if recent_hits:
+            joined = ", ".join(recent_hits)
+            print(f"[{i}/{len(symbols)}] تخطي {sym} بسبب أحداث خلال آخر شمعتين: {joined}")
+            continue
+
         recent_alerts = list(runtime.alerts)
         if args.recent > 0 and runtime.series.length() > 0:
             cutoff_idx = max(0, runtime.series.length() - args.recent)
             cutoff_time = runtime.series.get_time(cutoff_idx)
             recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
 
-        latest = runtime.gather_console_metrics().get("latest_events", {})
         summary = []
         for key in ["BOS","BOS_PLUS","CHOCH","IDM","IDM_OB","EXT_OB","GOLDEN_ZONE"]:
             if key in latest:
@@ -8885,6 +8914,16 @@ def _android_cli_entry() -> int:
         except Exception as e:
             if args.debug:
                 print(f"[{i}/{len(symbols)}] {sym}: error {e}", file=sys.stderr)
+            continue
+
+        metrics = runtime.gather_console_metrics()
+        latest_events = metrics.get("latest_events") or {}
+        recent_hits, recent_times = _collect_recent_event_hits(
+            runtime.series, latest_events, bars=2
+        )
+        if recent_hits:
+            joined = ", ".join(recent_hits)
+            print(f"[{i}/{len(symbols)}] تخطي {sym} بسبب أحداث خلال آخر شمعتين: {joined}")
             continue
 
         recent_alerts = list(runtime.alerts)
@@ -9357,6 +9396,16 @@ def _android_cli_entry() -> int:
             runtime.process([{"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')} for c in candles])
         except Exception as e:
             print(f"[{i}/{len(symbols)}] {sym}: error {e}", file=sys.stderr)
+            continue
+
+        metrics = runtime.gather_console_metrics()
+        latest_events = metrics.get("latest_events") or {}
+        recent_hits, recent_times = _collect_recent_event_hits(
+            runtime.series, latest_events, bars=2
+        )
+        if recent_hits:
+            joined = ", ".join(recent_hits)
+            print(f"[{i}/{len(symbols)}] تخطي {sym} بسبب أحداث خلال آخر شمعتين: {joined}")
             continue
 
         recent_alerts = list(getattr(runtime, "alerts", []))

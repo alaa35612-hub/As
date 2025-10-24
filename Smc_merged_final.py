@@ -1156,6 +1156,14 @@ class SmartMoneyAlgoProE5:
         self.alerts: List[Tuple[int, str]] = []
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
+        self.latest_fvg_events: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {
+            "bullish": {"created": None, "mitigated": None},
+            "bearish": {"created": None, "mitigated": None},
+        }
+        self.latest_order_block_events: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {
+            "IDM": {"new": None, "touched": None},
+            "EXT": {"new": None, "touched": None},
+        }
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1322,7 +1330,22 @@ class SmartMoneyAlgoProE5:
             "scob_colored_bars": len(self.bar_colors),
         }
         metrics["current_price"] = self.series.get("close")
-        metrics["latest_events"] = self._collect_latest_console_events()
+        latest_events = self._collect_latest_console_events()
+        latest_events["FVG_STATE"] = {
+            side: {
+                name: (value.copy() if isinstance(value, dict) else None)
+                for name, value in states.items()
+            }
+            for side, states in self.latest_fvg_events.items()
+        }
+        latest_events["ORDER_BLOCK_STATE"] = {
+            key: {
+                name: (value.copy() if isinstance(value, dict) else None)
+                for name, value in states.items()
+            }
+            for key, states in self.latest_order_block_events.items()
+        }
+        metrics["latest_events"] = latest_events
         return metrics
 
     def _register_label_event(self, label: Label) -> None:
@@ -1392,6 +1415,95 @@ class SmartMoneyAlgoProE5:
                 top=box.top,
                 bottom=box.bottom,
             )
+
+    def _register_fvg_event(
+        self,
+        direction: str,
+        event: str,
+        *,
+        upper: float,
+        lower: float,
+        timestamp: int,
+    ) -> None:
+        dir_key = "bullish" if direction.lower().startswith("bull") else "bearish"
+        event_key = "mitigated" if event.lower().startswith("mitig") else "created"
+        price_low, price_high = sorted((lower, upper))
+        base_key = "FVG_BULLISH" if dir_key == "bullish" else "FVG_BEARISH"
+        event_suffix = "MITIGATED" if event_key == "mitigated" else "NEW"
+        label = "Bullish FVG" if dir_key == "bullish" else "Bearish FVG"
+        display = (
+            f"{label} ({event_key}) {format_price(price_low)} → {format_price(price_high)}"
+        )
+        payload = {
+            "text": label,
+            "price": (price_low, price_high),
+            "direction": dir_key,
+            "event": event_key,
+            "time": timestamp,
+            "time_display": format_timestamp(timestamp),
+            "display": display,
+        }
+        self.console_event_log[base_key] = payload.copy()
+        self.console_event_log[f"{base_key}_{event_suffix}"] = payload.copy()
+        self.latest_fvg_events[dir_key][event_key] = payload
+        self._trace(
+            "fvg",
+            "register",
+            timestamp=timestamp,
+            key=f"{base_key}_{event_suffix}",
+            direction=dir_key,
+            event=event_key,
+            low=price_low,
+            high=price_high,
+        )
+
+    def _record_order_block_event(
+        self,
+        block_type: str,
+        event: str,
+        box: Box,
+        direction: str,
+        *,
+        timestamp: Optional[int] = None,
+    ) -> None:
+        block_key = block_type.upper()
+        event_key = event.lower()
+        ts = timestamp if isinstance(timestamp, int) else box.get_left()
+        price_low, price_high = sorted((box.get_bottom(), box.get_top()))
+        label = "IDM OB" if block_key == "IDM" else "EXT OB"
+        display = (
+            f"{label} ({direction}) {format_price(price_low)} → {format_price(price_high)} [{event_key}]"
+        )
+        payload = {
+            "text": box.text or label,
+            "price": (price_low, price_high),
+            "direction": direction,
+            "event": event_key,
+            "time": ts,
+            "time_display": format_timestamp(ts),
+            "display": display,
+        }
+        base_key = f"{block_key}_OB"
+        if base_key in self.console_event_log:
+            enriched = self.console_event_log[base_key].copy()
+            enriched.update(payload)
+            self.console_event_log[base_key] = enriched
+        else:
+            self.console_event_log[base_key] = payload.copy()
+        self.console_event_log[f"{base_key}_{event_key.upper()}"] = payload.copy()
+        if block_key not in self.latest_order_block_events:
+            self.latest_order_block_events[block_key] = {"new": None, "touched": None}
+        self.latest_order_block_events[block_key][event_key] = payload
+        self._trace(
+            "order_block",
+            "register",
+            timestamp=ts,
+            key=f"{base_key}_{event_key.upper()}",
+            direction=direction,
+            event=event_key,
+            low=price_low,
+            high=price_high,
+        )
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {key: value.copy() for key, value in self.console_event_log.items()}
@@ -4516,6 +4628,16 @@ class SmartMoneyAlgoProE5:
             fvg.i_textColor,
         )
         labelholder.unshift(label)
+        direction = (
+            "bullish" if holder is self.bullish_gap_holder else "bearish"
+        )
+        self._register_fvg_event(
+            direction,
+            "created",
+            upper=upper,
+            lower=lower,
+            timestamp=bar_time,
+        )
 
     def _fvg_delete(
         self,
@@ -4622,6 +4744,13 @@ class SmartMoneyAlgoProE5:
                     triggered = True
                 if triggered:
                     removed_flag = 1
+                    self._register_fvg_event(
+                        "bullish",
+                        "mitigated",
+                        upper=box_obj.get_top(),
+                        lower=box_obj.get_bottom(),
+                        timestamp=self.series.get_time(),
+                    )
                     self._fvg_delete(
                         i,
                         holder,
@@ -4654,6 +4783,13 @@ class SmartMoneyAlgoProE5:
                     triggered = True
                 if triggered:
                     removed_flag = -1
+                    self._register_fvg_event(
+                        "bearish",
+                        "mitigated",
+                        upper=box_obj.get_top(),
+                        lower=box_obj.get_bottom(),
+                        timestamp=self.series.get_time(),
+                    )
                     self._fvg_delete(
                         i,
                         holder,
@@ -5882,6 +6018,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text_color(self.inputs.order_block.clrtxtextbulliem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbulliembg)
                     self._register_box_event(zone)
+                    self._record_order_block_event("IDM", "new", zone, "bullish")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -5908,6 +6045,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text_color(self.inputs.order_block.clrtxtextbeariem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbeariembg)
                     self._register_box_event(zone)
+                    self._record_order_block_event("IDM", "new", zone, "bearish")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
@@ -5965,6 +6103,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text_color(self.inputs.order_block.clrtxtextbull)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbullbg)
                     self._register_box_event(zone)
+                    self._record_order_block_event("EXT", "new", zone, "bullish")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -5991,6 +6130,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text_color(self.inputs.order_block.clrtxtextbear)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbearbg)
                     self._register_box_event(zone)
+                    self._record_order_block_event("EXT", "new", zone, "bearish")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
@@ -6315,6 +6455,16 @@ class SmartMoneyAlgoProE5:
                     else:
                         self.arrmitOBBear.unshift(zone)
                         self.arrmitOBBeara.unshift(False)
+                if zone.text.strip() in ("IDM OB", "EXT OB") and zonesmit.get(i) == 1:
+                    ob_type = "IDM" if zone.text.strip() == "IDM OB" else "EXT"
+                    direction = "bearish" if isSupply else "bullish"
+                    self._record_order_block_event(
+                        ob_type,
+                        "touched",
+                        zone,
+                        direction,
+                        timestamp=self.series.get_time(),
+                    )
                 if isSupply:
                     if zonesmit.get(i) == 1:
                         isAlertextidm = True
@@ -8374,8 +8524,12 @@ _LAST_BUCKETS = {
     "IDM": ["idm @", " i d m "],
     "EXT OB": ["ext ob", "ext_ob", "ext  ob"],
     "IDM OB": ["idm ob"],
+    "IDM OB لمس": ["idm ob touched"],
     "Hist IDM OB": ["hist idm ob"],
     "Hist EXT OB": ["hist ext ob"],
+    "FVG صاعدة": ["bullish fvg", "fvg up"],
+    "FVG هابطة": ["bearish fvg", "fvg down"],
+    "EXT OB لمس": ["ext ob touched"],
     "الدوائر الحمراء": ["الدوائر الحمراء", "red circle"],
     "الدوائر الخضراء": ["الدوائر الخضراء", "green circle"],
 }
@@ -8387,8 +8541,14 @@ _METRIC_MAP = {
     "IDM": ["IDM", "idm"],
     "EXT OB": ["EXT_OB", "ext_ob", "EXT-OB"],
     "IDM OB": ["IDM_OB", "idm_ob"],
+    "IDM OB لمس": ["IDM_OB_TOUCHED"],
+    "IDM OB جديد": ["IDM_OB_NEW"],
     "Hist IDM OB": ["HIST_IDM_OB", "hist_idm_ob"],
     "Hist EXT OB": ["HIST_EXT_OB", "hist_ext_ob"],
+    "FVG صاعدة": ["FVG_BULLISH", "FVG_UP", "FVG_BULLISH_NEW", "FVG_BULLISH_MITIGATED"],
+    "FVG هابطة": ["FVG_BEARISH", "FVG_DN", "FVG_BEARISH_NEW", "FVG_BEARISH_MITIGATED"],
+    "EXT OB لمس": ["EXT_OB_TOUCHED"],
+    "EXT OB جديد": ["EXT_OB_NEW"],
     "الدوائر الحمراء": ["RED_CIRCLE", "red_circle", "RED_CIRCLES"],
     "الدوائر الخضراء": ["GREEN_CIRCLE", "green_circle", "GREEN_CIRCLES"],
 }
@@ -8531,6 +8691,67 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("صناديق Order Flow:", c("OF_BOX"))
     print("مستويات السيولة :", c("LIQ"))
     print("شموع SCOB       :", c("SCOB"))
+
+    metrics = {}
+    latest_events: Dict[str, Any] = {}
+    if hasattr(runtime, "gather_console_metrics"):
+        try:
+            metrics = runtime.gather_console_metrics() or {}
+            latest_events = metrics.get("latest_events", {}) or {}
+        except Exception:
+            metrics = {}
+            latest_events = {}
+
+    fvg_state = latest_events.get("FVG_STATE", {}) if isinstance(latest_events, dict) else {}
+    ob_state = latest_events.get("ORDER_BLOCK_STATE", {}) if isinstance(latest_events, dict) else {}
+
+    def _fmt_detail(payload: Optional[Dict[str, Any]], include_dir: bool = True) -> str:
+        if not isinstance(payload, dict):
+            return "—"
+        price = payload.get("price")
+        price_str = ""
+        if isinstance(price, (list, tuple)) and len(price) >= 2:
+            price_str = f"{format_price(price[0])} → {format_price(price[1])}"
+        elif isinstance(price, (int, float)):
+            price_str = format_price(float(price))
+        direction = payload.get("direction") if include_dir else None
+        dir_label = {"bullish": "صعود", "bearish": "هبوط"}.get(direction, direction)
+        event = payload.get("event")
+        event_label = {
+            "created": "جديد",
+            "mitigated": "مخفف",
+            "new": "جديد",
+            "touched": "ملامس",
+        }.get(event, event)
+        parts: List[str] = []
+        if include_dir and dir_label:
+            parts.append(str(dir_label))
+        if price_str and price_str != "NaN":
+            parts.append(price_str)
+        if event_label:
+            parts.append(str(event_label))
+        ts_display = payload.get("time_display")
+        if ts_display:
+            parts.append(str(ts_display))
+        if parts:
+            return " | ".join(parts)
+        return payload.get("display") or payload.get("text") or "—"
+
+    bull_fvg = fvg_state.get("bullish") if isinstance(fvg_state, dict) else {}
+    bear_fvg = fvg_state.get("bearish") if isinstance(fvg_state, dict) else {}
+    print("\nتفاصيل فجوات FVG:")
+    print(" - صاعدة (إنشاء):", _fmt_detail((bull_fvg or {}).get("created"), include_dir=False))
+    print(" - صاعدة (كسر):", _fmt_detail((bull_fvg or {}).get("mitigated"), include_dir=False))
+    print(" - هابطة (إنشاء):", _fmt_detail((bear_fvg or {}).get("created"), include_dir=False))
+    print(" - هابطة (كسر):", _fmt_detail((bear_fvg or {}).get("mitigated"), include_dir=False))
+
+    idm_events = ob_state.get("IDM") if isinstance(ob_state, dict) else {}
+    ext_events = ob_state.get("EXT") if isinstance(ob_state, dict) else {}
+    print("\nتفاصيل مناطق Order Block:")
+    print(" - IDM OB (إنشاء):", _fmt_detail((idm_events or {}).get("new")))
+    print(" - IDM OB (ملامسة):", _fmt_detail((idm_events or {}).get("touched")))
+    print(" - EXT OB (إنشاء):", _fmt_detail((ext_events or {}).get("new")))
+    print(" - EXT OB (ملامسة):", _fmt_detail((ext_events or {}).get("touched")))
 
     print("\nأحدث الإشارات مع الأسعار")
     if not recent_alerts:
@@ -8957,6 +9178,67 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("صناديق Order Flow:", c("OF_BOX"))
     print("مستويات السيولة :", c("LIQ"))
     print("شموع SCOB       :", c("SCOB"))
+
+    metrics = {}
+    latest_events: Dict[str, Any] = {}
+    if hasattr(runtime, "gather_console_metrics"):
+        try:
+            metrics = runtime.gather_console_metrics() or {}
+            latest_events = metrics.get("latest_events", {}) or {}
+        except Exception:
+            metrics = {}
+            latest_events = {}
+
+    fvg_state = latest_events.get("FVG_STATE", {}) if isinstance(latest_events, dict) else {}
+    ob_state = latest_events.get("ORDER_BLOCK_STATE", {}) if isinstance(latest_events, dict) else {}
+
+    def _fmt_detail(payload: Optional[Dict[str, Any]], include_dir: bool = True) -> str:
+        if not isinstance(payload, dict):
+            return "—"
+        price = payload.get("price")
+        price_str = ""
+        if isinstance(price, (list, tuple)) and len(price) >= 2:
+            price_str = f"{format_price(price[0])} → {format_price(price[1])}"
+        elif isinstance(price, (int, float)):
+            price_str = format_price(float(price))
+        direction = payload.get("direction") if include_dir else None
+        dir_label = {"bullish": "صعود", "bearish": "هبوط"}.get(direction, direction)
+        event = payload.get("event")
+        event_label = {
+            "created": "جديد",
+            "mitigated": "مخفف",
+            "new": "جديد",
+            "touched": "ملامس",
+        }.get(event, event)
+        parts: List[str] = []
+        if include_dir and dir_label:
+            parts.append(str(dir_label))
+        if price_str and price_str != "NaN":
+            parts.append(price_str)
+        if event_label:
+            parts.append(str(event_label))
+        ts_display = payload.get("time_display")
+        if ts_display:
+            parts.append(str(ts_display))
+        if parts:
+            return " | ".join(parts)
+        return payload.get("display") or payload.get("text") or "—"
+
+    bull_fvg = fvg_state.get("bullish") if isinstance(fvg_state, dict) else {}
+    bear_fvg = fvg_state.get("bearish") if isinstance(fvg_state, dict) else {}
+    print("\nتفاصيل فجوات FVG:")
+    print(" - صاعدة (إنشاء):", _fmt_detail((bull_fvg or {}).get("created"), include_dir=False))
+    print(" - صاعدة (كسر):", _fmt_detail((bull_fvg or {}).get("mitigated"), include_dir=False))
+    print(" - هابطة (إنشاء):", _fmt_detail((bear_fvg or {}).get("created"), include_dir=False))
+    print(" - هابطة (كسر):", _fmt_detail((bear_fvg or {}).get("mitigated"), include_dir=False))
+
+    idm_events = ob_state.get("IDM") if isinstance(ob_state, dict) else {}
+    ext_events = ob_state.get("EXT") if isinstance(ob_state, dict) else {}
+    print("\nتفاصيل مناطق Order Block:")
+    print(" - IDM OB (إنشاء):", _fmt_detail((idm_events or {}).get("new")))
+    print(" - IDM OB (ملامسة):", _fmt_detail((idm_events or {}).get("touched")))
+    print(" - EXT OB (إنشاء):", _fmt_detail((ext_events or {}).get("new")))
+    print(" - EXT OB (ملامسة):", _fmt_detail((ext_events or {}).get("touched")))
 
     print("\\nأحدث الإشارات مع الأسعار")
     latest = _extract_latest_from_runtime(runtime)

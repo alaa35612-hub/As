@@ -62,6 +62,16 @@ ANSI_SYMBOL = ANSI_VALUE_POS
 ANSI_ALERT_BULL = ANSI_VALUE_POS
 ANSI_ALERT_BEAR = ANSI_VALUE_NEG
 
+
+def _direction_to_display(direction: Optional[str]) -> Optional[str]:
+    norm = _normalize_direction(direction) if direction else None
+    if norm == "bullish":
+        return "صاعد"
+    if norm == "bearish":
+        return "هابط"
+    return None
+
+
 ALERT_BULLISH_KEYWORDS = (
     "bull",
     "bullish",
@@ -1372,7 +1382,11 @@ class SmartMoneyAlgoProE5:
         if box in self.boxes:
             self.boxes.remove(box)
         store.push(box)
-        self._register_box_event(box, status="archived")
+        self._register_box_event(
+            box,
+            status="archived",
+            direction=getattr(box, "runtime_direction", None),
+        )
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
@@ -1497,6 +1511,9 @@ class SmartMoneyAlgoProE5:
         metrics["idm_ob_touched"] = _status_total(idm_counter, "touched", "retest")
         metrics["ext_ob_new"] = _status_total(ext_counter, "new")
         metrics["ext_ob_touched"] = _status_total(ext_counter, "touched", "retest")
+        golden_counter = self.console_box_status_tally.get("GOLDEN_ZONE", Counter())
+        metrics["golden_zone_new"] = _status_total(golden_counter, "new")
+        metrics["golden_zone_touched"] = _status_total(golden_counter, "touched", "retest")
         metrics["current_price"] = self.series.get("close")
         metrics["latest_events"] = self._collect_latest_console_events()
         return metrics
@@ -1563,7 +1580,14 @@ class SmartMoneyAlgoProE5:
             "source": "confirmed",
         }
 
-    def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
+    def _register_box_event(
+        self,
+        box: Box,
+        *,
+        status: str = "active",
+        event_time: Optional[int] = None,
+        direction: Optional[str] = None,
+    ) -> None:
         text = box.text.strip()
         key: Optional[str] = None
         if text == "IDM OB":
@@ -1576,13 +1600,20 @@ class SmartMoneyAlgoProE5:
             key = "HIST_EXT_OB"
         elif text == "Golden zone":
             key = "GOLDEN_ZONE"
+        if direction is None:
+            direction = getattr(box, "runtime_direction", None)
+        direction_norm = _normalize_direction(direction) if direction else None
+        if direction_norm:
+            setattr(box, "runtime_direction", direction_norm)
+        direction_display = _direction_to_display(direction_norm)
+
         if key:
             ts = event_time if isinstance(event_time, int) else box.left
             status_label = self.BOX_STATUS_LABELS.get(status, status)
             status_key = status if isinstance(status, str) and status else "active"
             tally = self.console_box_status_tally[key]
             tally[status_key] += 1
-            self.console_event_log[key] = {
+            payload = {
                 "text": box.text,
                 "price": (box.bottom, box.top),
                 "time": ts,
@@ -1591,6 +1622,11 @@ class SmartMoneyAlgoProE5:
                 "status": status,
                 "status_display": status_label,
             }
+            if direction_norm:
+                payload["direction"] = direction_norm
+            if direction_display:
+                payload["direction_display"] = direction_display
+            self.console_event_log[key] = payload
             self._trace(
                 "box",
                 "register",
@@ -1600,7 +1636,38 @@ class SmartMoneyAlgoProE5:
                 top=box.top,
                 bottom=box.bottom,
                 status=status,
+                direction=direction_norm,
             )
+
+    def _register_fvg_event(
+        self,
+        *,
+        direction: str,
+        upper: float,
+        lower: float,
+        timestamp: int,
+        status: str = "new",
+    ) -> None:
+        norm = _normalize_direction(direction)
+        if norm not in {"bullish", "bearish"}:
+            return
+        key = "FVG_UP" if norm == "bullish" else "FVG_DN"
+        top, bottom = (upper, lower)
+        if top < bottom:
+            top, bottom = bottom, top
+        status_display = "منطقة جديدة" if status == "new" else "تمت ملامستها"
+        payload = {
+            "text": "فجوة FVG صاعدة" if norm == "bullish" else "فجوة FVG هابطة",
+            "price": (bottom, top),
+            "time": timestamp,
+            "time_display": format_timestamp(timestamp),
+            "display": f"FVG {'صاعدة' if norm == 'bullish' else 'هابطة'} {format_price(bottom)} → {format_price(top)}",
+            "status": status,
+            "status_display": status_display,
+            "direction": norm,
+            "direction_display": _direction_to_display(norm),
+        }
+        self.console_event_log[key] = payload
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -2339,6 +2406,8 @@ class SmartMoneyAlgoProE5:
         self.transp = "color.new(color.gray,100)"
         self.bxf: Optional[Box] = None
         self.bxty = 0
+        self.bxf_last_status: str = ""
+        self.bxf_last_touch_time: Optional[int] = None
         self.prev_oi1: float = NA
 
         self.motherHigh_history: List[float] = [self.motherHigh]
@@ -4743,6 +4812,15 @@ class SmartMoneyAlgoProE5:
         )
         labelholder.unshift(label)
 
+        direction = "bullish" if holder is self.bullish_gap_holder else "bearish"
+        self._register_fvg_event(
+            direction=direction,
+            upper=upper,
+            lower=lower,
+            timestamp=bar_time,
+            status="new",
+        )
+
     def _fvg_delete(
         self,
         index: int,
@@ -4848,6 +4926,13 @@ class SmartMoneyAlgoProE5:
                     triggered = True
                 if triggered:
                     removed_flag = 1
+                    self._register_fvg_event(
+                        direction="bullish",
+                        upper=box_obj.get_top(),
+                        lower=box_obj.get_bottom(),
+                        timestamp=self.series.get_time(),
+                        status="touched",
+                    )
                     self._fvg_delete(
                         i,
                         holder,
@@ -4880,6 +4965,13 @@ class SmartMoneyAlgoProE5:
                     triggered = True
                 if triggered:
                     removed_flag = -1
+                    self._register_fvg_event(
+                        direction="bearish",
+                        upper=box_obj.get_top(),
+                        lower=box_obj.get_bottom(),
+                        timestamp=self.series.get_time(),
+                        status="touched",
+                    )
                     self._fvg_delete(
                         i,
                         holder,
@@ -6107,7 +6199,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbulliem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbulliembg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", direction="bullish")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -6133,7 +6225,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbeariem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbeariembg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", direction="bearish")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
@@ -6190,7 +6282,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbull)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbullbg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", direction="bullish")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -6216,7 +6308,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbear)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbearbg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", direction="bearish")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
@@ -6563,7 +6655,12 @@ class SmartMoneyAlgoProE5:
                         zone.set_border_color(self.inputs.order_block.colorMitigated)
                     zonesmit.set(i, 3 if zonesmit.get(i) == 1 else 2)
                 status = "retest" if prev_state == 1 else "touched"
-                self._register_box_event(zone, status=status, event_time=self.series.get_time())
+                self._register_box_event(
+                    zone,
+                    status=status,
+                    event_time=self.series.get_time(),
+                    direction="bearish" if isSupply else "bullish",
+                )
                 if self.inputs.order_block.showBrkob:
                     zones.remove(i)
                     zonesmit.remove(i)
@@ -7136,9 +7233,35 @@ class SmartMoneyAlgoProE5:
                 self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
                 self.bxf.set_text("Golden zone")
                 self.bxf.set_text_color(self.inputs.structure_util.oteclr)
-                self._register_box_event(self.bxf, status="new")
+                direction = "bullish" if dir_up else "bearish"
+                self._register_box_event(self.bxf, status="new", direction=direction)
+                self.bxf_last_status = "new"
+                self.bxf_last_touch_time = None
                 self.bxty = 1 if dir_up else -1
                 self.prev_oi1 = float(oi1)
+
+        if self.bxf:
+            zone_top = self.bxf.get_top()
+            zone_bottom = self.bxf.get_bottom()
+            if not math.isnan(zone_top) and not math.isnan(zone_bottom):
+                high = self.series.get("high")
+                low = self.series.get("low")
+                touch_top = max(zone_top, zone_bottom)
+                touch_bottom = min(zone_top, zone_bottom)
+                if high >= touch_bottom and low <= touch_top:
+                    current_time = self.series.get_time()
+                    if self.bxf_last_touch_time != current_time:
+                        direction_hint = getattr(self.bxf, "runtime_direction", None)
+                        if not direction_hint:
+                            direction_hint = "bullish" if self.bxty >= 0 else "bearish"
+                        self._register_box_event(
+                            self.bxf,
+                            status="touched",
+                            event_time=current_time,
+                            direction=direction_hint,
+                        )
+                        self.bxf_last_status = "touched"
+                        self.bxf_last_touch_time = current_time
 
         self._sync_state_mirrors()
 
@@ -8005,21 +8128,35 @@ def run_runtime_from_file(
     timeframe: str = "",
     bars: int = 0,
     inputs: Optional[IndicatorInputs] = None,
+    *,
+    formation_lookback: int = 2,
+    telegram_cfg: Optional[_CLISettings] = None,
+    symbol: Optional[str] = None,
 ) -> None:
     candles = json.loads(source.read_text())
     if bars > 0:
         candles = candles[-bars:]
     runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe if timeframe else None)
     runtime.process(candles)
-    triggers = _detect_new_formations_and_touches(runtime, args.timeframe, cfg.formation_lookback)
+    effective_tf = timeframe or getattr(runtime, "base_timeframe", "") or ""
+    triggers = _detect_new_formations_and_touches(
+        runtime,
+        effective_tf,
+        max(1, formation_lookback),
+        symbol=_format_symbol(symbol) if symbol else None,
+    )
     if triggers:
         for _ln in triggers:
             print("  →", _ln)
-        if cfg.tg_enable:
+        if telegram_cfg and getattr(telegram_cfg, "tg_enable", False):
             try:
-                _send_tg(cfg, [f"{sym} {args.timeframe}"] + triggers)
-            except Exception:
-                pass
+                title = telegram_cfg.tg_title_prefix
+            except AttributeError:
+                title = "SMC Alert"
+            header = title
+            if symbol:
+                header = f"{title} :: {_format_symbol(symbol)}"
+            _send_tg(telegram_cfg, [header] + triggers)
     render_report(runtime, outfile)
 
 
@@ -8035,6 +8172,8 @@ METRIC_LABELS = [
     ("idm_ob_touched", "IDM OB تم ملامستها"),
     ("ext_ob_new", "EXT OB تم إنشائها حديثاً"),
     ("ext_ob_touched", "EXT OB تم ملامستها"),
+    ("golden_zone_new", "Golden zone تم إنشائها حديثاً"),
+    ("golden_zone_touched", "Golden zone تم ملامستها"),
     ("bullish_fvg", "فجوات FVG صاعدة"),
     ("bearish_fvg", "فجوات FVG هابطة"),
     ("order_flow_boxes", "صناديق Order Flow"),
@@ -8055,6 +8194,8 @@ EVENT_DISPLAY_ORDER = [
     ("HIST_IDM_OB", "Hist IDM OB"),
     ("HIST_EXT_OB", "Hist EXT OB"),
     ("GOLDEN_ZONE", "Golden zone"),
+    ("FVG_UP", "FVG صاعدة"),
+    ("FVG_DN", "FVG هابطة"),
     ("X", "X"),
     ("RED_CIRCLE", "الدوائر الحمراء"),
     ("GREEN_CIRCLE", "الدوائر الخضراء"),
@@ -8198,6 +8339,70 @@ def _collect_recent_event_hits(
         if isinstance(timestamp, (int, float)) and int(timestamp) in recent_times:
             hits.append(str(key))
     return hits, recent_times
+
+
+def _detect_new_formations_and_touches(
+    runtime: "SmartMoneyAlgoProE5",
+    timeframe: str,
+    lookback_bars: int,
+    *,
+    symbol: Optional[str] = None,
+) -> List[str]:
+    if lookback_bars <= 0:
+        return []
+    try:
+        metrics = runtime.gather_console_metrics()
+    except Exception:
+        metrics = {}
+    latest_events = metrics.get("latest_events") if isinstance(metrics, dict) else {}
+    hits, _ = _collect_recent_event_hits(runtime.series, latest_events, bars=max(1, lookback_bars))
+    if not hits:
+        return []
+    ordered_hits: List[str] = []
+    known_order = {key: label for key, label in EVENT_DISPLAY_ORDER}
+    for key, _ in EVENT_DISPLAY_ORDER:
+        if key in hits:
+            ordered_hits.append(key)
+    for key in hits:
+        if key not in ordered_hits:
+            ordered_hits.append(key)
+    lines: List[str] = []
+    for key in ordered_hits:
+        event = latest_events.get(key) if isinstance(latest_events, dict) else None
+        if not isinstance(event, dict):
+            continue
+        label = known_order.get(key, str(key))
+        price = event.get("price")
+        if isinstance(price, tuple) and len(price) >= 2:
+            price_str = f"{format_price(price[0])} → {format_price(price[1])}"
+        else:
+            numeric_price = price if isinstance(price, (int, float)) else None
+            price_str = format_price(numeric_price)
+        extras: List[str] = []
+        status_display = event.get("status_display")
+        if status_display:
+            extras.append(str(status_display))
+        direction_hint = _resolve_direction(
+            event.get("direction"),
+            event.get("direction_display"),
+            event.get("text"),
+            event.get("status"),
+        )
+        direction_display = _direction_to_display(direction_hint)
+        if direction_display:
+            extras.append(direction_display)
+        extra_text = f" ({' | '.join(extras)})" if extras else ""
+        time_display = event.get("time_display") or format_timestamp(event.get("time"))
+        segment = f"{label}{extra_text} @ {price_str}"
+        if time_display and time_display != "—":
+            segment = f"{segment} - {time_display}"
+        tf = timeframe.strip()
+        if tf:
+            segment = f"{segment} | {tf}"
+        if symbol:
+            segment = f"{symbol} :: {segment}"
+        lines.append(segment)
+    return lines
 
 
 def scan_binance(
@@ -8539,6 +8744,7 @@ class _CLISettings:
     # scanner controls
     tg_enable: bool = False
     tg_title_prefix: str = "SMC Alert"
+    formation_lookback: int = 2
     # matching indicator behavior
     ob_test_mode: str = "CLOSE"  # goes to demand_supply.mittigation_filt (canonicalized inside)
     zone_type: str = "Mother Bar"  # goes to order_block.poi_type
@@ -8694,6 +8900,7 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
         exclude_patterns=args.exclude_patterns,
         include_only=args.include_only,
         drop_last_incomplete=args.drop_last,
+        formation_lookback=max(1, args.recent),
     )
     return cfg, args
 
@@ -8915,11 +9122,47 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("IDM OB تم ملامستها    :", _box_total("IDM_OB", ("touched", "retest")))
     print("EXT OB تم إنشائها حديثاً:", _box_total("EXT_OB", ("new",)))
     print("EXT OB تم ملامستها    :", _box_total("EXT_OB", ("touched", "retest")))
+    print("Golden zone تم إنشائها حديثاً:", _box_total("GOLDEN_ZONE", ("new",)))
+    print("Golden zone تم ملامستها    :", _box_total("GOLDEN_ZONE", ("touched", "retest")))
     print("فجوات FVG صاعدة :", c("FVG_UP"))
     print("فجوات FVG هابطة :", c("FVG_DN"))
     print("صناديق Order Flow:", c("OF_BOX"))
     print("مستويات السيولة :", c("LIQ"))
     print("شموع SCOB       :", c("SCOB"))
+
+    latest_events = metrics.get("latest_events", {})
+
+    def _print_event_line(key: str, label: str) -> None:
+        event = latest_events.get(key)
+        if not isinstance(event, dict):
+            return
+        price = event.get("price")
+        if isinstance(price, tuple) and len(price) >= 2:
+            price_str = f"{format_price(price[0])} → {format_price(price[1])}"
+        else:
+            numeric_price = price if isinstance(price, (int, float)) else None
+            price_str = format_price(numeric_price)
+        extras: List[str] = []
+        status_display = event.get("status_display")
+        if status_display:
+            extras.append(str(status_display))
+        direction_hint = _resolve_direction(
+            event.get("direction"),
+            event.get("direction_display"),
+            event.get("text"),
+        )
+        direction_display = _direction_to_display(direction_hint)
+        if direction_display:
+            extras.append(direction_display)
+        extra_text = f" ({' | '.join(extras)})" if extras else ""
+        print(f"{label} : {price_str}{extra_text}")
+
+    print("\nتفاصيل المناطق والفجوات")
+    _print_event_line("IDM_OB", "IDM OB")
+    _print_event_line("EXT_OB", "EXT OB")
+    _print_event_line("GOLDEN_ZONE", "Golden zone")
+    _print_event_line("FVG_UP", "فجوة FVG صاعدة")
+    _print_event_line("FVG_DN", "فجوة FVG هابطة")
 
     print("\nأحدث الإشارات مع الأسعار")
     if not recent_alerts:
@@ -9050,10 +9293,25 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                     )
                 )
 
+        triggers = _detect_new_formations_and_touches(
+            runtime,
+            args.timeframe,
+            cfg.formation_lookback,
+            symbol=_format_symbol(sym),
+        )
+        if cfg.tg_enable and triggers:
+            try:
+                _send_tg(cfg, [f"{cfg.tg_title_prefix} :: {_format_symbol(sym)}"] + triggers)
+            except Exception:
+                if args.debug:
+                    print("فشل إرسال تنبيه تيليجرام", file=sys.stderr)
+
         if recent_alerts or args.verbose:
             _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
             if summary:
                 print("  •", " | ".join(summary))
+            for trig in triggers:
+                print("  →", trig)
             for ts, title in recent_alerts[-10:]:
                 ts_s = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts/1000))
                 colored_title = _colorize_directional_text(title)
@@ -9381,6 +9639,12 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 if any(kw in t for kw in kws):
                     out[key] += 1
         return out
+    metrics = {}
+    if hasattr(runtime, "gather_console_metrics"):
+        try:
+            metrics = runtime.gather_console_metrics() or {}
+        except Exception:
+            metrics = {}
     counts = _count_by_keywords(recent_alerts)
     c = lambda k: counts.get(k,0)
     print("\\nعدد التنبيهات :", len(recent_alerts))
@@ -9409,11 +9673,48 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("IDM OB تم ملامستها    :", _box_total("IDM_OB", ("touched", "retest")))
     print("EXT OB تم إنشائها حديثاً:", _box_total("EXT_OB", ("new",)))
     print("EXT OB تم ملامستها    :", _box_total("EXT_OB", ("touched", "retest")))
+    print("Golden zone تم إنشائها حديثاً:", _box_total("GOLDEN_ZONE", ("new",)))
+    print("Golden zone تم ملامستها    :", _box_total("GOLDEN_ZONE", ("touched", "retest")))
     print("فجوات FVG صاعدة :", c("FVG_UP"))
     print("فجوات FVG هابطة :", c("FVG_DN"))
     print("صناديق Order Flow:", c("OF_BOX"))
     print("مستويات السيولة :", c("LIQ"))
     print("شموع SCOB       :", c("SCOB"))
+
+    latest_events = metrics.get("latest_events") if isinstance(metrics, dict) else {}
+
+    def _print_event_line(key: str, label: str) -> None:
+        event = latest_events.get(key) if isinstance(latest_events, dict) else None
+        if not isinstance(event, dict):
+            return
+        price = event.get("price")
+        if isinstance(price, tuple) and len(price) >= 2:
+            price_str = f"{format_price(price[0])} → {format_price(price[1])}"
+        else:
+            numeric_price = price if isinstance(price, (int, float)) else None
+            price_str = format_price(numeric_price)
+        extras: List[str] = []
+        status_display = event.get("status_display")
+        if status_display:
+            extras.append(str(status_display))
+        direction_hint = _resolve_direction(
+            event.get("direction"),
+            event.get("direction_display"),
+            event.get("text"),
+        )
+        direction_display = _direction_to_display(direction_hint)
+        if direction_display:
+            extras.append(direction_display)
+        extra_text = f" ({' | '.join(extras)})" if extras else ""
+        print(f"{label} : {price_str}{extra_text}")
+
+    if latest_events:
+        print("\\nتفاصيل المناطق والفجوات")
+        _print_event_line("IDM_OB", "IDM OB")
+        _print_event_line("EXT_OB", "EXT OB")
+        _print_event_line("GOLDEN_ZONE", "Golden zone")
+        _print_event_line("FVG_UP", "فجوة FVG صاعدة")
+        _print_event_line("FVG_DN", "فجوة FVG هابطة")
 
     print("\\nأحدث الإشارات مع الأسعار")
     latest = _extract_latest_from_runtime(runtime)
@@ -9474,6 +9775,7 @@ class Settings:
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
+        self.formation_lookback = kw.get("formation_lookback", 2)
 
 def _parse_args_android():
     import argparse
@@ -9575,6 +9877,7 @@ def _parse_args_android():
         zone_type=zone_type,
         drop_last_incomplete=args.drop_last,
         max_scan=args.max_symbols,
+        formation_lookback=max(1, args.recent),
     )
     return cfg, args
 
@@ -9681,8 +9984,23 @@ def _android_cli_entry() -> int:
             except Exception:
                 pass
 
+        triggers = _detect_new_formations_and_touches(
+            runtime,
+            args.timeframe,
+            cfg.formation_lookback,
+            symbol=_format_symbol(sym),
+        )
+        if cfg.tg_enable and triggers:
+            try:
+                _send_tg(cfg, [f"{cfg.tg_title_prefix} :: {_format_symbol(sym)}"] + triggers)
+            except Exception:
+                if args.debug:
+                    print("فشل إرسال تنبيه تيليجرام", file=sys.stderr)
+
         if recent_alerts or args.verbose:
             _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
+            for trig in triggers:
+                print("  →", trig)
             alerts_total += len(recent_alerts)
 
     if args.verbose:

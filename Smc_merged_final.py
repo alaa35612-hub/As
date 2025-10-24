@@ -32,6 +32,7 @@ import re
 import sys
 import textwrap
 import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -1163,6 +1164,7 @@ class SmartMoneyAlgoProE5:
         self.alerts: List[Tuple[int, str]] = []
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
+        self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
             max_age = 1
@@ -1366,6 +1368,21 @@ class SmartMoneyAlgoProE5:
             "order_flow_boxes": order_flow_boxes,
             "scob_colored_bars": len(self.bar_colors),
         }
+        idm_counter = self.console_box_status_tally.get("IDM_OB", Counter())
+        ext_counter = self.console_box_status_tally.get("EXT_OB", Counter())
+
+        def _status_total(counter: Dict[str, Any], *keys: str) -> int:
+            total = 0
+            for key in keys:
+                value = counter.get(key, 0) if isinstance(counter, dict) else 0
+                if isinstance(value, (int, float)):
+                    total += int(value)
+            return total
+
+        metrics["idm_ob_new"] = _status_total(idm_counter, "new")
+        metrics["idm_ob_touched"] = _status_total(idm_counter, "touched", "retest")
+        metrics["ext_ob_new"] = _status_total(ext_counter, "new")
+        metrics["ext_ob_touched"] = _status_total(ext_counter, "touched", "retest")
         metrics["current_price"] = self.series.get("close")
         metrics["latest_events"] = self._collect_latest_console_events()
         return metrics
@@ -1448,6 +1465,9 @@ class SmartMoneyAlgoProE5:
         if key:
             ts = event_time if isinstance(event_time, int) else box.left
             status_label = self.BOX_STATUS_LABELS.get(status, status)
+            status_key = status if isinstance(status, str) and status else "active"
+            tally = self.console_box_status_tally[key]
+            tally[status_key] += 1
             self.console_event_log[key] = {
                 "text": box.text,
                 "price": (box.bottom, box.top),
@@ -7897,6 +7917,10 @@ METRIC_LABELS = [
     ("idm_labels", "علامات IDM"),
     ("demand_zones", "مناطق الطلب"),
     ("supply_zones", "مناطق العرض"),
+    ("idm_ob_new", "IDM OB تم إنشائها حديثاً"),
+    ("idm_ob_touched", "IDM OB تم ملامستها"),
+    ("ext_ob_new", "EXT OB تم إنشائها حديثاً"),
+    ("ext_ob_touched", "EXT OB تم ملامستها"),
     ("bullish_fvg", "فجوات FVG صاعدة"),
     ("bearish_fvg", "فجوات FVG هابطة"),
     ("order_flow_boxes", "صناديق Order Flow"),
@@ -8769,6 +8793,25 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("علامات IDM      :", c("IDM"))
     print("مناطق الطلب     :", c("DEMAND"))
     print("مناطق العرض     :", c("SUPPLY"))
+    box_tally = getattr(runtime, "console_box_status_tally", {})
+
+    def _box_total(name: str, statuses: Sequence[str]) -> int:
+        if not isinstance(box_tally, dict):
+            return 0
+        counter = box_tally.get(name, {})
+        if not isinstance(counter, dict):
+            return 0
+        total = 0
+        for status in statuses:
+            value = counter.get(status, 0)
+            if isinstance(value, (int, float)):
+                total += int(value)
+        return total
+
+    print("IDM OB تم إنشائها حديثاً:", _box_total("IDM_OB", ("new",)))
+    print("IDM OB تم ملامستها    :", _box_total("IDM_OB", ("touched", "retest")))
+    print("EXT OB تم إنشائها حديثاً:", _box_total("EXT_OB", ("new",)))
+    print("EXT OB تم ملامستها    :", _box_total("EXT_OB", ("touched", "retest")))
     print("فجوات FVG صاعدة :", c("FVG_UP"))
     print("فجوات FVG هابطة :", c("FVG_DN"))
     print("صناديق Order Flow:", c("OF_BOX"))

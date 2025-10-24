@@ -50,6 +50,9 @@
 - ألوان الأعمدة المسجلة: 0
 - تنبيهات Order Flow: 0
 
+## فلترة الأحداث
+- `console.max_age_bars` يتحكم بعدد الأعمدة الأخيرة المسموح بها عند عرض قسم `latest_events`. أي حدث أقدم من هذه النافذة يتم تجاهله، بينما القيمة 0 تعطل الفلترة وتحافظ على كل السجلات التاريخية للمنطقة.
+
 ## قائمة التحقق (Coverage 99.99%)
 
 | الحزمة | المدخلات | المتغيرات | المصفوفات | الدوال | التنبيهات | العناصر المرسومة |
@@ -70,6 +73,7 @@
 - candle.showISB: False
 - candle.showOSB: False
 - candle.trendRule: SMA50
+- console.max_age_bars: 0
 - demand_supply.i_tf_ob: 
 - demand_supply.i_tf_ob_mtf: 240
 - demand_supply.ibear_ob_css: #ef3a3a19

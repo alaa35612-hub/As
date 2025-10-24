@@ -22,6 +22,7 @@ parity against the Pine logic.
 from __future__ import annotations
 
 import argparse
+import bisect
 import dataclasses
 import datetime
 import inspect
@@ -714,6 +715,11 @@ class CandleInputs:
 
 
 @dataclass
+class ConsoleInputs:
+    max_age_bars: int = 0
+
+
+@dataclass
 class StructureInputs:
     isOTE: bool = False
     ote1: float = 0.78
@@ -919,6 +925,7 @@ class IndicatorInputs:
     liquidity: LiquidityInputs = field(default_factory=LiquidityInputs)
     order_flow: OrderFlowInputs = field(default_factory=OrderFlowInputs)
     candle: CandleInputs = field(default_factory=CandleInputs)
+    console: ConsoleInputs = field(default_factory=ConsoleInputs)
     structure_util: StructureInputs = field(default_factory=StructureInputs)
     ict_structure: ICTMarketStructureInputs = field(default_factory=ICTMarketStructureInputs)
     key_levels: KeyLevelsInputs = field(default_factory=KeyLevelsInputs)
@@ -1156,6 +1163,15 @@ class SmartMoneyAlgoProE5:
         self.alerts: List[Tuple[int, str]] = []
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
+        console_inputs = getattr(self.inputs, "console", None)
+        if console_inputs is None:
+            max_age = 0
+        else:
+            try:
+                max_age = int(getattr(console_inputs, "max_age_bars", 0) or 0)
+            except (TypeError, ValueError):
+                max_age = 0
+        self.console_max_age_bars = max(0, max_age)
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1184,6 +1200,14 @@ class SmartMoneyAlgoProE5:
     # ------------------------------------------------------------------
     # Pine primitive wrappers
     # ------------------------------------------------------------------
+    BOX_STATUS_LABELS = {
+        "new": "منطقة جديدة",
+        "active": "منطقة نشطة",
+        "touched": "تمت ملامستها",
+        "retest": "إعادة اختبار",
+        "archived": "محفوظة تاريخياً",
+    }
+
     def label_new(
         self,
         x: int,
@@ -1221,7 +1245,7 @@ class SmartMoneyAlgoProE5:
     ) -> Box:
         bx = Box(left, right, top, bottom, color, color, text=text, text_color=text_color)
         self.boxes.append(bx)
-        self._register_box_event(bx)
+        self._register_box_event(bx, status="new")
         self._trace("box.new", "create", timestamp=right, left=left, right=right, top=top, bottom=bottom, color=color, text=text)
         return bx
 
@@ -1232,7 +1256,7 @@ class SmartMoneyAlgoProE5:
         if box in self.boxes:
             self.boxes.remove(box)
         store.push(box)
-        self._register_box_event(box)
+        self._register_box_event(box, status="archived")
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
@@ -1268,6 +1292,27 @@ class SmartMoneyAlgoProE5:
 
     def _trace(self, section: str, message: str, *, timestamp: Optional[int], **payload: Any) -> None:
         self.tracer.log(section, message, timestamp=timestamp, **payload)
+
+    def _bars_ago_from_time(self, timestamp: Any) -> Optional[int]:
+        if self.series.length() == 0:
+            return None
+        if not isinstance(timestamp, (int, float)):
+            return None
+        ts = int(timestamp)
+        if ts <= 0:
+            return None
+        idx = bisect.bisect_right(self.series.time, ts) - 1
+        if idx < 0:
+            return self.series.length()
+        return (self.series.length() - 1) - idx
+
+    def _console_event_within_age(self, timestamp: Any) -> bool:
+        if self.console_max_age_bars <= 0:
+            return True
+        bars_ago = self._bars_ago_from_time(timestamp)
+        if bars_ago is None:
+            return True
+        return bars_ago <= self.console_max_age_bars
 
     def gather_console_metrics(self) -> Dict[str, Any]:
         """Aggregate runtime metrics for console presentation."""
@@ -1353,6 +1398,10 @@ class SmartMoneyAlgoProE5:
             elif label.color == self.inputs.structure.bull:
                 key = "GREEN_CIRCLE"
         if key:
+            if key in ("BOS", "CHOCH"):
+                existing = self.console_event_log.get(key)
+                if existing and existing.get("source") == "confirmed":
+                    return
             self.console_event_log[key] = {
                 "text": label.text,
                 "price": label.y,
@@ -1362,7 +1411,28 @@ class SmartMoneyAlgoProE5:
             }
             self._trace("label", "register", timestamp=label.x, key=key, text=label.text, price=label.y)
 
-    def _register_box_event(self, box: Box) -> None:
+    def _register_structure_break_event(
+        self,
+        key: str,
+        price: float,
+        timestamp: int,
+        *,
+        bullish: bool,
+    ) -> None:
+        direction_text = "صاعد" if bullish else "هابط"
+        display = f"{key} @ {format_price(price)} ({direction_text})"
+        self.console_event_log[key] = {
+            "text": key,
+            "price": price,
+            "time": timestamp,
+            "time_display": format_timestamp(timestamp),
+            "display": display,
+            "direction": "bullish" if bullish else "bearish",
+            "direction_display": direction_text,
+            "source": "confirmed",
+        }
+
+    def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
         key: Optional[str] = None
         if text == "IDM OB":
@@ -1376,12 +1446,16 @@ class SmartMoneyAlgoProE5:
         elif text == "Golden zone":
             key = "GOLDEN_ZONE"
         if key:
+            ts = event_time if isinstance(event_time, int) else box.left
+            status_label = self.BOX_STATUS_LABELS.get(status, status)
             self.console_event_log[key] = {
                 "text": box.text,
                 "price": (box.bottom, box.top),
-                "time": box.left,
-                "time_display": format_timestamp(box.left),
+                "time": ts,
+                "time_display": format_timestamp(ts),
                 "display": f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}",
+                "status": status,
+                "status_display": status_label,
             }
             self._trace(
                 "box",
@@ -1391,13 +1465,18 @@ class SmartMoneyAlgoProE5:
                 text=box.text,
                 top=box.top,
                 bottom=box.bottom,
+                status=status,
             )
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
-        events: Dict[str, Dict[str, Any]] = {key: value.copy() for key, value in self.console_event_log.items()}
-        for payload in events.values():
+        events: Dict[str, Dict[str, Any]] = {}
+        for key, value in self.console_event_log.items():
+            payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
+            if not self._console_event_within_age(payload.get("time")):
+                continue
+            events[key] = payload
 
         def record_label(
             key: str,
@@ -1405,6 +1484,10 @@ class SmartMoneyAlgoProE5:
             formatter: Optional[Callable[[Label], str]] = None,
         ) -> None:
             for lbl in reversed(self.labels):
+                if not isinstance(lbl, Label):
+                    continue
+                if not self._console_event_within_age(lbl.x):
+                    continue
                 if predicate(lbl):
                     display = formatter(lbl) if formatter else f"{lbl.text} @ {format_price(lbl.y)}"
                     events[key] = {
@@ -1430,6 +1513,10 @@ class SmartMoneyAlgoProE5:
                 else:
                     seq = list(source)
                 for bx in reversed(seq):
+                    if not isinstance(bx, Box):
+                        continue
+                    if not self._console_event_within_age(bx.left):
+                        continue
                     if predicate(bx):
                         events[key] = {
                             "text": bx.text,
@@ -1437,6 +1524,11 @@ class SmartMoneyAlgoProE5:
                             "display": f"{bx.text} {format_price(bx.bottom)} → {format_price(bx.top)}",
                             "time": bx.left,
                             "time_display": format_timestamp(bx.left),
+                            "status": events.get(key, {}).get("status", "active"),
+                            "status_display": events.get(key, {}).get(
+                                "status_display",
+                                self.BOX_STATUS_LABELS.get("active", "active"),
+                            ),
                         }
                         return
 
@@ -5881,7 +5973,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbulliem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbulliembg)
-                    self._register_box_event(zone)
+                    self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -5907,7 +5999,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbeariem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbeariembg)
-                    self._register_box_event(zone)
+                    self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
@@ -5964,7 +6056,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbull)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbullbg)
-                    self._register_box_event(zone)
+                    self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -5990,11 +6082,17 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbear)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbearbg)
-                    self._register_box_event(zone)
+                    self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
         color = self.inputs.structure.bull if trend else self.inputs.structure.bear
+        event_time = self.series.get_time()
+        if not math.isnan(y):
+            if name == "BOS":
+                self._register_structure_break_event("BOS", y, event_time, bullish=trend)
+            elif name == "ChoCh":
+                self._register_structure_break_event("CHOCH", y, event_time, bullish=trend)
         if name == "BOS" and self.inputs.structure.showSMC:
             ln = self.line_new(x, y, self.series.get_time(), y, "xloc.bar_time", color, "line.style_dashed")
             lbl = self.label_new(
@@ -6306,6 +6404,7 @@ class SmartMoneyAlgoProE5:
                 (isSupply and self.series.get("high") >= botZone and self.series.get("high", 1) < botZone)
                 or ((not isSupply) and self.series.get("low") <= topZone and self.series.get("low", 1) > topZone)
             ):
+                prev_state = zonesmit.get(i)
                 zone.set_right(self.series.get_time())
                 zone.set_extend("extend.none")
                 if self.inputs.order_block.extndBox and self.series.get("high") >= topZone and self.series.get("low") <= botZone:
@@ -6329,6 +6428,8 @@ class SmartMoneyAlgoProE5:
                         zone.set_bgcolor(self.inputs.order_block.colorMitigated)
                         zone.set_border_color(self.inputs.order_block.colorMitigated)
                     zonesmit.set(i, 3 if zonesmit.get(i) == 1 else 2)
+                status = "retest" if prev_state == 1 else "touched"
+                self._register_box_event(zone, status=status, event_time=self.series.get_time())
                 if self.inputs.order_block.showBrkob:
                     zones.remove(i)
                     zonesmit.remove(i)
@@ -6901,7 +7002,7 @@ class SmartMoneyAlgoProE5:
                 self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
                 self.bxf.set_text("Golden zone")
                 self.bxf.set_text_color(self.inputs.structure_util.oteclr)
-                self._register_box_event(self.bxf)
+                self._register_box_event(self.bxf, status="new")
                 self.bxty = 1 if dir_up else -1
                 self.prev_oi1 = float(oi1)
 
@@ -7764,11 +7865,17 @@ def render_report(
     outfile.write_text(content + "\n")
 
 
-def run_runtime_from_file(source: Path, outfile: Path, timeframe: str = "", bars: int = 0) -> None:
+def run_runtime_from_file(
+    source: Path,
+    outfile: Path,
+    timeframe: str = "",
+    bars: int = 0,
+    inputs: Optional[IndicatorInputs] = None,
+) -> None:
     candles = json.loads(source.read_text())
     if bars > 0:
         candles = candles[-bars:]
-    runtime = SmartMoneyAlgoProE5(base_timeframe=timeframe if timeframe else None)
+    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe if timeframe else None)
     runtime.process(candles)
     triggers = _detect_new_formations_and_touches(runtime, args.timeframe, cfg.formation_lookback)
     if triggers:
@@ -7857,6 +7964,9 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
                     display_text = " → ".join(format_price(p) for p in price)
                 else:
                     display_text = format_price(price if isinstance(price, (int, float)) else None)
+            status_display = event.get("status_display")
+            if status_display:
+                display_text = f"{display_text} [{status_display}]"
             time_display = event.get("time_display") or format_timestamp(event.get("time"))
             if time_display and time_display != "—":
                 display_text = f"{display_text} | {time_display}"
@@ -7915,6 +8025,7 @@ def scan_binance(
     tracer: Optional[ExecutionTracer] = None,
     *,
     min_daily_change: float = 0.0,
+    inputs: Optional[IndicatorInputs] = None,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
@@ -7945,7 +8056,7 @@ def scan_binance(
                 )
             continue
         candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(base_timeframe=timeframe, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
         metrics["daily_change_percent"] = daily_change
@@ -7972,7 +8083,7 @@ def scan_binance(
         if primary_runtime is None:
             primary_runtime = runtime
     if primary_runtime is None:
-        primary_runtime = SmartMoneyAlgoProE5(tracer=tracer)
+        primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
         primary_runtime.process([])
     return primary_runtime, summaries
 
@@ -8013,9 +8124,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--trace", action="store_true", help="Enable execution tracing")
     parser.add_argument("--trace-file", type=Path, help="Write execution trace to JSON file")
     parser.add_argument("--compare-trace", type=Path, help="قارن التتبع الحالي بملف JSON مرجعي")
+    parser.add_argument(
+        "--max-age-bars",
+        type=int,
+        default=0,
+        help="Ignore console events older than this many completed bars (0 disables filtering)",
+    )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
+    if args.max_age_bars < 0:
+        parser.error("--max-age-bars يجب أن يكون رقمًا غير سالب")
 
     start = time.time()
 
@@ -8029,12 +8148,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result = tracer.compare(args.compare_trace)
             print_trace_comparison(result)
 
+    indicator_inputs = IndicatorInputs()
+    indicator_inputs.console.max_age_bars = args.max_age_bars
+
     if args.pullback_report:
         log("Foundation")
         pine_text = args.pine_source.read_text(encoding="utf-8")
         python_text = Path(__file__).read_text(encoding="utf-8")
         log("Inventory")
-        runtime = SmartMoneyAlgoProE5(base_timeframe=args.analysis_timeframe or None, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=indicator_inputs,
+            base_timeframe=args.analysis_timeframe or None,
+            tracer=tracer,
+        )
         log("Timeline")
         runtime.process([])
         log("Rendering")
@@ -8051,7 +8177,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.bars > 0:
             candles = candles[-args.bars :]
         log("Inventory")
-        runtime = SmartMoneyAlgoProE5(base_timeframe=args.analysis_timeframe or None, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=indicator_inputs,
+            base_timeframe=args.analysis_timeframe or None,
+            tracer=tracer,
+        )
         log("Timeline")
         runtime.process(candles)
         perform_comparison()
@@ -8064,7 +8194,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.no_scan:
         log("Foundation")
         log("Inventory")
-        runtime = SmartMoneyAlgoProE5(base_timeframe=args.analysis_timeframe or None, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=indicator_inputs,
+            base_timeframe=args.analysis_timeframe or None,
+            tracer=tracer,
+        )
         log("Timeline")
         runtime.process([])
         perform_comparison()
@@ -8085,6 +8219,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.concurrency,
         tracer,
         min_daily_change=args.min_daily_change,
+        inputs=indicator_inputs,
     )
     perform_comparison()
     log("Rendering")
@@ -8626,7 +8761,12 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         summary = []
         for key in ["BOS","BOS_PLUS","CHOCH","IDM","IDM_OB","EXT_OB","GOLDEN_ZONE"]:
             if key in latest:
-                summary.append(latest[key]["display"])
+                evt = latest[key]
+                disp = evt.get("display", "")
+                status_disp = evt.get("status_display")
+                if status_disp:
+                    disp = f"{disp} [{status_disp}]"
+                summary.append(disp)
 
         if recent_alerts or args.verbose:
             _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)

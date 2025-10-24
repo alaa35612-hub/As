@@ -7764,24 +7764,6 @@ def render_report(
     outfile.write_text(content + "\n")
 
 
-def run_runtime_from_file(source: Path, outfile: Path, timeframe: str = "", bars: int = 0) -> None:
-    candles = json.loads(source.read_text())
-    if bars > 0:
-        candles = candles[-bars:]
-    runtime = SmartMoneyAlgoProE5(base_timeframe=timeframe if timeframe else None)
-    runtime.process(candles)
-    triggers = _detect_new_formations_and_touches(runtime, args.timeframe, cfg.formation_lookback)
-    if triggers:
-        for _ln in triggers:
-            print("  →", _ln)
-        if cfg.tg_enable:
-            try:
-                _send_tg(cfg, [f"{sym} {args.timeframe}"] + triggers)
-            except Exception:
-                pass
-    render_report(runtime, outfile)
-
-
 METRIC_LABELS = [
     ("alerts", "عدد التنبيهات"),
     ("pullback_arrows", "إشارات Pullback"),
@@ -8169,6 +8151,7 @@ class _CLISettings:
     # scanner controls
     tg_enable: bool = False
     tg_title_prefix: str = "SMC Alert"
+    formation_lookback: int = 5
     # matching indicator behavior
     ob_test_mode: str = "CLOSE"  # goes to demand_supply.mittigation_filt (canonicalized inside)
     zone_type: str = "Mother Bar"  # goes to order_block.poi_type
@@ -8294,6 +8277,7 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--include-only", default="")
     # misc
     p.add_argument("--recent", type=int, default=5)
+    p.add_argument("--formation-lookback", type=int, default=5)
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--tg", action="store_true", default=False)
@@ -8324,6 +8308,7 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
         exclude_patterns=args.exclude_patterns,
         include_only=args.include_only,
         drop_last_incomplete=args.drop_last,
+        formation_lookback=max(0, args.formation_lookback),
     )
     return cfg, args
 
@@ -8462,6 +8447,72 @@ def _extract_latest_from_runtime(runtime):
             if item is not None:
                 result[name] = item
     return result
+
+
+def _detect_new_formations_and_touches(runtime: Any, timeframe: str, lookback: int) -> List[str]:
+    """Select recent structural events suitable for Telegram delivery."""
+
+    if lookback <= 0:
+        return []
+
+    series = getattr(runtime, "series", None)
+    if series is None:
+        return []
+
+    try:
+        if series.length() <= 0:
+            return []
+        latest_time = int(series.get_time(0))
+    except Exception:
+        return []
+
+    base_seconds = getattr(runtime, "base_tf_seconds", None)
+    tf_seconds = _parse_timeframe_to_seconds(timeframe, base_seconds)
+    if tf_seconds is None or tf_seconds <= 0:
+        tf_seconds = base_seconds or 60
+    window_ms = int(tf_seconds * max(1, lookback) * 1000)
+    cutoff = latest_time - window_ms
+
+    seen: set[str] = set()
+    lines: List[str] = []
+
+    try:
+        latest_map = _extract_latest_from_runtime(runtime)
+    except Exception:
+        latest_map = {}
+
+    for name, item in latest_map.items():
+        if not item:
+            continue
+        ts, display = item
+        try:
+            ts_int = int(ts)
+        except Exception:
+            ts_int = 0
+        if ts_int and ts_int >= cutoff:
+            text = f"{name}: {display}"
+            if text not in seen:
+                lines.append(text)
+                seen.add(text)
+
+    alerts = getattr(runtime, "alerts", [])
+    for ts, title in alerts:
+        if not title:
+            continue
+        try:
+            ts_int = int(ts)
+        except Exception:
+            ts_int = 0
+        if ts_int and ts_int < cutoff:
+            continue
+        stamp = format_timestamp(ts_int) if ts_int else ""
+        text = f"{stamp} :: {title}" if stamp else str(title)
+        if text not in seen:
+            lines.append(text)
+            seen.add(text)
+
+    return lines
+
 
 def _last_by_keywords(alerts, mapping):
     # alerts: [(ts_ms, title)]
@@ -8603,6 +8654,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     alerts_total = 0
     symbols = symbols[:int(cfg.max_scan)]
     for i, sym in enumerate(symbols, 1):
+        triggers: List[str] = []
         try:
             candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
             if cfg.drop_last_incomplete and candles:
@@ -8611,6 +8663,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             runtime._bos_break_source = cfg.bos_confirmation
             runtime._strict_close_for_break = cfg.strict_close_for_break
             runtime.process(candles)
+            triggers = _detect_new_formations_and_touches(runtime, args.timeframe, cfg.formation_lookback)
         except Exception as e:
             if args.debug:
                 print(f"[{i}/{len(symbols)}] {sym}: error {e}", file=sys.stderr)
@@ -8636,6 +8689,10 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 ts_s = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts/1000))
                 print(f"  - {ts_s} :: {title}")
             alerts_total += len(recent_alerts)
+
+        if cfg.tg_enable and triggers:
+            header = f"{cfg.tg_title_prefix}: {sym} {args.timeframe}"
+            _send_tg(cfg, [header] + triggers)
 
     if args.verbose:
         print(f"\nDone. Symbols scanned: {len(symbols)}, alerts: {alerts_total}")
@@ -9016,6 +9073,7 @@ class Settings:
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
+        self.formation_lookback = kw.get("formation_lookback", 5)
 
 def _parse_args_android():
     import argparse
@@ -9061,6 +9119,7 @@ def _parse_args_android():
     p.add_argument("--no-ote", action="store_true")
     p.add_argument("--no-ote-alert", action="store_true")
     p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
+    p.add_argument("--formation-lookback", type=int, default=5)
     args = p.parse_args()
 
     zone_type = args.zone_type
@@ -9109,6 +9168,7 @@ def _parse_args_android():
         mtf_lookahead=args.mtf_lookahead,
         zone_type=zone_type,
         drop_last_incomplete=args.drop_last,
+        formation_lookback=max(0, args.formation_lookback),
     )
     return cfg, args
 
@@ -9171,6 +9231,7 @@ def _android_cli_entry() -> int:
 
     alerts_total = 0
     for i, sym in enumerate(symbols, 1):
+        triggers: List[str] = []
         try:
             candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
             if cfg.drop_last_incomplete and candles:
@@ -9179,6 +9240,7 @@ def _android_cli_entry() -> int:
             runtime._bos_break_source = cfg.bos_confirmation
             runtime._strict_close_for_break = cfg.strict_close_for_break
             runtime.process([{"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')} for c in candles])
+            triggers = _detect_new_formations_and_touches(runtime, args.timeframe, cfg.formation_lookback)
         except Exception as e:
             print(f"[{i}/{len(symbols)}] {sym}: error {e}", file=sys.stderr)
             continue
@@ -9196,6 +9258,10 @@ def _android_cli_entry() -> int:
         if recent_alerts or args.verbose:
             _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
             alerts_total += len(recent_alerts)
+
+        if cfg.tg_enable and triggers:
+            header = f"{cfg.tg_title_prefix}: {sym} {args.timeframe}"
+            _send_tg(cfg, [header] + triggers)
 
     if args.verbose:
         print(f"\\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")

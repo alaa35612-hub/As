@@ -22,6 +22,7 @@ parity against the Pine logic.
 from __future__ import annotations
 
 import argparse
+import bisect
 import dataclasses
 import datetime
 import inspect
@@ -714,6 +715,11 @@ class CandleInputs:
 
 
 @dataclass
+class ConsoleInputs:
+    max_age_bars: int = 1
+
+
+@dataclass
 class StructureInputs:
     isOTE: bool = False
     ote1: float = 0.78
@@ -919,6 +925,7 @@ class IndicatorInputs:
     liquidity: LiquidityInputs = field(default_factory=LiquidityInputs)
     order_flow: OrderFlowInputs = field(default_factory=OrderFlowInputs)
     candle: CandleInputs = field(default_factory=CandleInputs)
+    console: ConsoleInputs = field(default_factory=ConsoleInputs)
     structure_util: StructureInputs = field(default_factory=StructureInputs)
     ict_structure: ICTMarketStructureInputs = field(default_factory=ICTMarketStructureInputs)
     key_levels: KeyLevelsInputs = field(default_factory=KeyLevelsInputs)
@@ -1156,6 +1163,15 @@ class SmartMoneyAlgoProE5:
         self.alerts: List[Tuple[int, str]] = []
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
+        console_inputs = getattr(self.inputs, "console", None)
+        if console_inputs is None:
+            max_age = 1
+        else:
+            try:
+                max_age = int(getattr(console_inputs, "max_age_bars", 1) or 1)
+            except (TypeError, ValueError):
+                max_age = 1
+        self.console_max_age_bars = max(1, max_age)
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1184,6 +1200,14 @@ class SmartMoneyAlgoProE5:
     # ------------------------------------------------------------------
     # Pine primitive wrappers
     # ------------------------------------------------------------------
+    BOX_STATUS_LABELS = {
+        "new": "منطقة جديدة",
+        "active": "منطقة نشطة",
+        "touched": "تمت ملامستها",
+        "retest": "إعادة اختبار",
+        "archived": "محفوظة تاريخياً",
+    }
+
     def label_new(
         self,
         x: int,
@@ -1221,7 +1245,7 @@ class SmartMoneyAlgoProE5:
     ) -> Box:
         bx = Box(left, right, top, bottom, color, color, text=text, text_color=text_color)
         self.boxes.append(bx)
-        self._register_box_event(bx)
+        self._register_box_event(bx, status="new")
         self._trace("box.new", "create", timestamp=right, left=left, right=right, top=top, bottom=bottom, color=color, text=text)
         return bx
 
@@ -1232,7 +1256,7 @@ class SmartMoneyAlgoProE5:
         if box in self.boxes:
             self.boxes.remove(box)
         store.push(box)
-        self._register_box_event(box)
+        self._register_box_event(box, status="archived")
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
@@ -1268,6 +1292,27 @@ class SmartMoneyAlgoProE5:
 
     def _trace(self, section: str, message: str, *, timestamp: Optional[int], **payload: Any) -> None:
         self.tracer.log(section, message, timestamp=timestamp, **payload)
+
+    def _bars_ago_from_time(self, timestamp: Any) -> Optional[int]:
+        if self.series.length() == 0:
+            return None
+        if not isinstance(timestamp, (int, float)):
+            return None
+        ts = int(timestamp)
+        if ts <= 0:
+            return None
+        idx = bisect.bisect_right(self.series.time, ts) - 1
+        if idx < 0:
+            return self.series.length()
+        return (self.series.length() - 1) - idx
+
+    def _console_event_within_age(self, timestamp: Any) -> bool:
+        if self.console_max_age_bars <= 0:
+            return True
+        bars_ago = self._bars_ago_from_time(timestamp)
+        if bars_ago is None:
+            return True
+        return bars_ago <= self.console_max_age_bars
 
     def gather_console_metrics(self) -> Dict[str, Any]:
         """Aggregate runtime metrics for console presentation."""
@@ -1353,6 +1398,10 @@ class SmartMoneyAlgoProE5:
             elif label.color == self.inputs.structure.bull:
                 key = "GREEN_CIRCLE"
         if key:
+            if key in ("BOS", "CHOCH"):
+                existing = self.console_event_log.get(key)
+                if existing and existing.get("source") == "confirmed":
+                    return
             self.console_event_log[key] = {
                 "text": label.text,
                 "price": label.y,
@@ -1362,7 +1411,28 @@ class SmartMoneyAlgoProE5:
             }
             self._trace("label", "register", timestamp=label.x, key=key, text=label.text, price=label.y)
 
-    def _register_box_event(self, box: Box) -> None:
+    def _register_structure_break_event(
+        self,
+        key: str,
+        price: float,
+        timestamp: int,
+        *,
+        bullish: bool,
+    ) -> None:
+        direction_text = "صاعد" if bullish else "هابط"
+        display = f"{key} @ {format_price(price)} ({direction_text})"
+        self.console_event_log[key] = {
+            "text": key,
+            "price": price,
+            "time": timestamp,
+            "time_display": format_timestamp(timestamp),
+            "display": display,
+            "direction": "bullish" if bullish else "bearish",
+            "direction_display": direction_text,
+            "source": "confirmed",
+        }
+
+    def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
         key: Optional[str] = None
         if text == "IDM OB":
@@ -1376,12 +1446,16 @@ class SmartMoneyAlgoProE5:
         elif text == "Golden zone":
             key = "GOLDEN_ZONE"
         if key:
+            ts = event_time if isinstance(event_time, int) else box.left
+            status_label = self.BOX_STATUS_LABELS.get(status, status)
             self.console_event_log[key] = {
                 "text": box.text,
                 "price": (box.bottom, box.top),
-                "time": box.left,
-                "time_display": format_timestamp(box.left),
+                "time": ts,
+                "time_display": format_timestamp(ts),
                 "display": f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}",
+                "status": status,
+                "status_display": status_label,
             }
             self._trace(
                 "box",
@@ -1391,13 +1465,18 @@ class SmartMoneyAlgoProE5:
                 text=box.text,
                 top=box.top,
                 bottom=box.bottom,
+                status=status,
             )
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
-        events: Dict[str, Dict[str, Any]] = {key: value.copy() for key, value in self.console_event_log.items()}
-        for payload in events.values():
+        events: Dict[str, Dict[str, Any]] = {}
+        for key, value in self.console_event_log.items():
+            payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
+            if not self._console_event_within_age(payload.get("time")):
+                continue
+            events[key] = payload
 
         def record_label(
             key: str,
@@ -1405,6 +1484,10 @@ class SmartMoneyAlgoProE5:
             formatter: Optional[Callable[[Label], str]] = None,
         ) -> None:
             for lbl in reversed(self.labels):
+                if not isinstance(lbl, Label):
+                    continue
+                if not self._console_event_within_age(lbl.x):
+                    continue
                 if predicate(lbl):
                     display = formatter(lbl) if formatter else f"{lbl.text} @ {format_price(lbl.y)}"
                     events[key] = {
@@ -1430,6 +1513,10 @@ class SmartMoneyAlgoProE5:
                 else:
                     seq = list(source)
                 for bx in reversed(seq):
+                    if not isinstance(bx, Box):
+                        continue
+                    if not self._console_event_within_age(bx.left):
+                        continue
                     if predicate(bx):
                         events[key] = {
                             "text": bx.text,
@@ -1437,6 +1524,11 @@ class SmartMoneyAlgoProE5:
                             "display": f"{bx.text} {format_price(bx.bottom)} → {format_price(bx.top)}",
                             "time": bx.left,
                             "time_display": format_timestamp(bx.left),
+                            "status": events.get(key, {}).get("status", "active"),
+                            "status_display": events.get(key, {}).get(
+                                "status_display",
+                                self.BOX_STATUS_LABELS.get("active", "active"),
+                            ),
                         }
                         return
 
@@ -5881,7 +5973,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbulliem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbulliembg)
-                    self._register_box_event(zone)
+                    self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -5907,7 +5999,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbeariem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbeariembg)
-                    self._register_box_event(zone)
+                    self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
@@ -5964,7 +6056,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbull)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbullbg)
-                    self._register_box_event(zone)
+                    self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -5990,11 +6082,17 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbear)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbearbg)
-                    self._register_box_event(zone)
+                    self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
         color = self.inputs.structure.bull if trend else self.inputs.structure.bear
+        event_time = self.series.get_time()
+        if not math.isnan(y):
+            if name == "BOS":
+                self._register_structure_break_event("BOS", y, event_time, bullish=trend)
+            elif name == "ChoCh":
+                self._register_structure_break_event("CHOCH", y, event_time, bullish=trend)
         if name == "BOS" and self.inputs.structure.showSMC:
             ln = self.line_new(x, y, self.series.get_time(), y, "xloc.bar_time", color, "line.style_dashed")
             lbl = self.label_new(
@@ -6306,6 +6404,7 @@ class SmartMoneyAlgoProE5:
                 (isSupply and self.series.get("high") >= botZone and self.series.get("high", 1) < botZone)
                 or ((not isSupply) and self.series.get("low") <= topZone and self.series.get("low", 1) > topZone)
             ):
+                prev_state = zonesmit.get(i)
                 zone.set_right(self.series.get_time())
                 zone.set_extend("extend.none")
                 if self.inputs.order_block.extndBox and self.series.get("high") >= topZone and self.series.get("low") <= botZone:
@@ -6329,6 +6428,8 @@ class SmartMoneyAlgoProE5:
                         zone.set_bgcolor(self.inputs.order_block.colorMitigated)
                         zone.set_border_color(self.inputs.order_block.colorMitigated)
                     zonesmit.set(i, 3 if zonesmit.get(i) == 1 else 2)
+                status = "retest" if prev_state == 1 else "touched"
+                self._register_box_event(zone, status=status, event_time=self.series.get_time())
                 if self.inputs.order_block.showBrkob:
                     zones.remove(i)
                     zonesmit.remove(i)
@@ -6901,7 +7002,7 @@ class SmartMoneyAlgoProE5:
                 self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
                 self.bxf.set_text("Golden zone")
                 self.bxf.set_text_color(self.inputs.structure_util.oteclr)
-                self._register_box_event(self.bxf)
+                self._register_box_event(self.bxf, status="new")
                 self.bxty = 1 if dir_up else -1
                 self.prev_oi1 = float(oi1)
 
@@ -7764,11 +7865,17 @@ def render_report(
     outfile.write_text(content + "\n")
 
 
-def run_runtime_from_file(source: Path, outfile: Path, timeframe: str = "", bars: int = 0) -> None:
+def run_runtime_from_file(
+    source: Path,
+    outfile: Path,
+    timeframe: str = "",
+    bars: int = 0,
+    inputs: Optional[IndicatorInputs] = None,
+) -> None:
     candles = json.loads(source.read_text())
     if bars > 0:
         candles = candles[-bars:]
-    runtime = SmartMoneyAlgoProE5(base_timeframe=timeframe if timeframe else None)
+    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe if timeframe else None)
     runtime.process(candles)
     triggers = _detect_new_formations_and_touches(runtime, args.timeframe, cfg.formation_lookback)
     if triggers:
@@ -7857,6 +7964,9 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
                     display_text = " → ".join(format_price(p) for p in price)
                 else:
                     display_text = format_price(price if isinstance(price, (int, float)) else None)
+            status_display = event.get("status_display")
+            if status_display:
+                display_text = f"{display_text} [{status_display}]"
             time_display = event.get("time_display") or format_timestamp(event.get("time"))
             if time_display and time_display != "—":
                 display_text = f"{display_text} | {time_display}"
@@ -7907,6 +8017,40 @@ def _extract_daily_change_percent(ticker: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+def _collect_recent_event_hits(
+    series: Any,
+    latest_events: Any,
+    *,
+    bars: int = 2,
+) -> Tuple[List[str], List[int]]:
+    """Identify latest-event keys that fall within the most recent candles."""
+
+    if bars <= 0:
+        return [], []
+
+    recent_times: List[int] = []
+    if hasattr(series, "get_time"):
+        for offset in range(bars):
+            try:
+                ts = series.get_time(offset)
+            except Exception:
+                ts = None
+            if isinstance(ts, (int, float)) and ts > 0:
+                recent_times.append(int(ts))
+
+    if not recent_times or not isinstance(latest_events, dict):
+        return [], recent_times
+
+    hits: List[str] = []
+    for key, payload in latest_events.items():
+        timestamp: Optional[Union[int, float]] = None
+        if isinstance(payload, dict):
+            timestamp = payload.get("time") or payload.get("ts") or payload.get("timestamp")
+        if isinstance(timestamp, (int, float)) and int(timestamp) in recent_times:
+            hits.append(str(key))
+    return hits, recent_times
+
+
 def scan_binance(
     timeframe: str,
     limit: int,
@@ -7915,13 +8059,29 @@ def scan_binance(
     tracer: Optional[ExecutionTracer] = None,
     *,
     min_daily_change: float = 0.0,
+    inputs: Optional[IndicatorInputs] = None,
+    recent_window_bars: Optional[int] = None,
+    max_symbols: Optional[int] = None,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
     all_symbols = symbols or fetch_binance_usdtm_symbols(exchange)
+    if max_symbols and max_symbols > 0:
+        all_symbols = all_symbols[: int(max_symbols)]
     summaries: List[Dict[str, Any]] = []
     primary_runtime: Optional[SmartMoneyAlgoProE5] = None
+    window = recent_window_bars
+    if window is None:
+        console_inputs = getattr(inputs, "console", None) if inputs else None
+        if console_inputs is not None and getattr(console_inputs, "max_age_bars", None) is not None:
+            try:
+                window = int(console_inputs.max_age_bars) + 1
+            except Exception:
+                window = 2
+        else:
+            window = 2
+    window = max(1, int(window))
     for idx, symbol in enumerate(all_symbols):
         try:
             ticker = exchange.fetch_ticker(symbol)
@@ -7945,9 +8105,30 @@ def scan_binance(
                 )
             continue
         candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(base_timeframe=timeframe, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
+        latest_events = metrics.get("latest_events") or {}
+        recent_hits, recent_times = _collect_recent_event_hits(
+            runtime.series, latest_events, bars=window
+        )
+        if not recent_hits:
+            print(
+                f"تخطي {symbol} لعدم وجود أحداث خلال آخر {window} شموع",
+                flush=True,
+            )
+            if tracer and tracer.enabled:
+                tracer.log(
+                    "scan",
+                    "symbol_skipped_stale_events",
+                    timestamp=runtime.series.get_time(0) or None,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    reference_times=recent_times,
+                    window=window,
+                )
+            continue
+
         metrics["daily_change_percent"] = daily_change
         summaries.append(
             {
@@ -7972,7 +8153,7 @@ def scan_binance(
         if primary_runtime is None:
             primary_runtime = runtime
     if primary_runtime is None:
-        primary_runtime = SmartMoneyAlgoProE5(tracer=tracer)
+        primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
         primary_runtime.process([])
     return primary_runtime, summaries
 
@@ -7988,6 +8169,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         type=int,
         default=0,
         help="Number of candles to request per symbol when scanning (0 = full history)",
+    )
+    parser.add_argument(
+        "--symbol-limit",
+        type=int,
+        default=0,
+        help="أقصى عدد من الأزواج لمسحها خلال التشغيل (0 = كل الأزواج المتاحة)",
     )
     parser.add_argument("--bars", type=int, default=0, help="Limit number of candles to analyse from --data source")
     parser.add_argument("--symbols", type=str, default="")
@@ -8013,9 +8200,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--trace", action="store_true", help="Enable execution tracing")
     parser.add_argument("--trace-file", type=Path, help="Write execution trace to JSON file")
     parser.add_argument("--compare-trace", type=Path, help="قارن التتبع الحالي بملف JSON مرجعي")
+    parser.add_argument(
+        "--max-age-bars",
+        type=int,
+        default=1,
+        help="Ignore console events older than this many completed bars (minimum 1)",
+    )
+    parser.add_argument(
+        "--recent-window",
+        type=int,
+        default=0,
+        help="عدد الشموع الحديثة المستخدمة لتأكيد الأحداث أثناء مسح Binance (0 = استخدام max-age تلقائيًا)",
+    )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
+    if args.max_age_bars <= 0:
+        parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
+    if args.recent_window < 0:
+        parser.error("--recent-window يجب أن يكون رقمًا غير سالب")
+    if args.symbol_limit < 0:
+        parser.error("--symbol-limit يجب أن يكون رقمًا غير سالب")
 
     start = time.time()
 
@@ -8029,12 +8234,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result = tracer.compare(args.compare_trace)
             print_trace_comparison(result)
 
+    indicator_inputs = IndicatorInputs()
+    indicator_inputs.console.max_age_bars = args.max_age_bars
+    recent_window = args.recent_window or (indicator_inputs.console.max_age_bars + 1)
+    recent_window = max(recent_window, indicator_inputs.console.max_age_bars + 1)
+
     if args.pullback_report:
         log("Foundation")
         pine_text = args.pine_source.read_text(encoding="utf-8")
         python_text = Path(__file__).read_text(encoding="utf-8")
         log("Inventory")
-        runtime = SmartMoneyAlgoProE5(base_timeframe=args.analysis_timeframe or None, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=indicator_inputs,
+            base_timeframe=args.analysis_timeframe or None,
+            tracer=tracer,
+        )
         log("Timeline")
         runtime.process([])
         log("Rendering")
@@ -8051,7 +8265,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.bars > 0:
             candles = candles[-args.bars :]
         log("Inventory")
-        runtime = SmartMoneyAlgoProE5(base_timeframe=args.analysis_timeframe or None, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=indicator_inputs,
+            base_timeframe=args.analysis_timeframe or None,
+            tracer=tracer,
+        )
         log("Timeline")
         runtime.process(candles)
         perform_comparison()
@@ -8064,7 +8282,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.no_scan:
         log("Foundation")
         log("Inventory")
-        runtime = SmartMoneyAlgoProE5(base_timeframe=args.analysis_timeframe or None, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=indicator_inputs,
+            base_timeframe=args.analysis_timeframe or None,
+            tracer=tracer,
+        )
         log("Timeline")
         runtime.process([])
         perform_comparison()
@@ -8085,6 +8307,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.concurrency,
         tracer,
         min_daily_change=args.min_daily_change,
+        inputs=indicator_inputs,
+        recent_window_bars=recent_window,
+        max_symbols=args.symbol_limit or None,
     )
     perform_comparison()
     log("Rendering")
@@ -8119,6 +8344,18 @@ _MEME_BASES = {
     "AIDOGE","MEOW","GME","TOSHI","HOPPY","KITTY","LADYS","CREAM","PIPI","JEET","CHILLGUY","HUAHUA"
 }
 _DEFAULT_EXCLUDE_PATTERNS = "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME"
+
+
+@dataclass(frozen=True)
+class _EditorAutorunDefaults:
+    timeframe: str = "1m"
+    candle_limit: int = 600
+    max_symbols: int = 60
+    recent_bars: int = 2
+
+
+EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults()
+
 
 def _pct_24h(t: Dict) -> float:
     v = t.get("percentage")
@@ -8257,10 +8494,10 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p = argparse.ArgumentParser(prog="SMC Binance Scanner (embedded)")
     # market / selection
     p.add_argument("--symbol", "-s", default="")
-    p.add_argument("--max-symbols", "-n", type=int, default=300)
+    p.add_argument("--max-symbols", "-n", type=int, default=EDITOR_AUTORUN_DEFAULTS.max_symbols)
     # timeframe/limit
-    p.add_argument("--timeframe", "-t", default="1m")
-    p.add_argument("--limit", "-l", type=int, default=800)
+    p.add_argument("--timeframe", "-t", default=EDITOR_AUTORUN_DEFAULTS.timeframe)
+    p.add_argument("--limit", "-l", type=int, default=EDITOR_AUTORUN_DEFAULTS.candle_limit)
     p.add_argument("--drop-last", action="store_true", default=False)
     # indicator view toggles
     p.add_argument("--show-hl", action="store_true", default=False)
@@ -8293,11 +8530,17 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--exclude-patterns", default=_DEFAULT_EXCLUDE_PATTERNS)
     p.add_argument("--include-only", default="")
     # misc
-    p.add_argument("--recent", type=int, default=5)
+    p.add_argument("--recent", type=int, default=EDITOR_AUTORUN_DEFAULTS.recent_bars)
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--tg", action="store_true", default=False)
     args, _ = p.parse_known_args()
+    if args.limit <= 0:
+        p.error("--limit must be > 0")
+    if args.max_symbols <= 0:
+        p.error("--max-symbols must be > 0")
+    if args.recent <= 0:
+        p.error("--recent must be > 0")
 
     cfg = _CLISettings(
         market='usdtm',  # forced futures-only
@@ -8318,7 +8561,7 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
         strict_close_for_break=(args.bos_confirmation == "Close"),
         min_change=args.min_change,
         min_volume=args.min_volume,
-        max_scan=args.max_scan,
+        max_scan=min(args.max_scan, args.max_symbols),
         allow_meme=args.allow_meme,
         exclude_symbols=args.exclude_symbols,
         exclude_patterns=args.exclude_patterns,
@@ -8552,6 +8795,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
     cfg, args = _parse_args_android()
+    recent_window = max(1, args.recent)
 
     # Build symbols first with strong filters
     symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
@@ -8597,6 +8841,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         structure_util=utils,
         ict_structure=ICTMarketStructureInputs(swingSize=int(cfg.swing_size)),
     )
+    inputs.console.max_age_bars = max(1, recent_window - 1)
 
     # Run loop
     ex = _build_exchange(cfg.market)
@@ -8616,17 +8861,30 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 print(f"[{i}/{len(symbols)}] {sym}: error {e}", file=sys.stderr)
             continue
 
+        metrics = runtime.gather_console_metrics()
+        latest = metrics.get("latest_events", {})
+        recent_hits, recent_times = _collect_recent_event_hits(
+            runtime.series, latest, bars=recent_window
+        )
+        if not recent_hits:
+            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال آخر {recent_window} شموع")
+            continue
+
         recent_alerts = list(runtime.alerts)
-        if args.recent > 0 and runtime.series.length() > 0:
-            cutoff_idx = max(0, runtime.series.length() - args.recent)
+        if recent_window > 0 and runtime.series.length() > 0:
+            cutoff_idx = max(0, runtime.series.length() - recent_window)
             cutoff_time = runtime.series.get_time(cutoff_idx)
             recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
 
-        latest = runtime.gather_console_metrics().get("latest_events", {})
         summary = []
         for key in ["BOS","BOS_PLUS","CHOCH","IDM","IDM_OB","EXT_OB","GOLDEN_ZONE"]:
             if key in latest:
-                summary.append(latest[key]["display"])
+                evt = latest[key]
+                disp = evt.get("display", "")
+                status_disp = evt.get("status_display")
+                if status_disp:
+                    disp = f"{disp} [{status_disp}]"
+                summary.append(disp)
 
         if recent_alerts or args.verbose:
             _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
@@ -8711,9 +8969,18 @@ def _android_cli_entry() -> int:
                 print(f"[{i}/{len(symbols)}] {sym}: error {e}", file=sys.stderr)
             continue
 
+        metrics = runtime.gather_console_metrics()
+        latest_events = metrics.get("latest_events") or {}
+        recent_hits, recent_times = _collect_recent_event_hits(
+            runtime.series, latest_events, bars=recent_window
+        )
+        if not recent_hits:
+            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال آخر {recent_window} شموع")
+            continue
+
         recent_alerts = list(runtime.alerts)
-        if args.recent > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
-            cutoff_idx = max(0, runtime.series.length() - args.recent)
+        if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
+            cutoff_idx = max(0, runtime.series.length() - recent_window)
             try:
                 cutoff_time = runtime.series.get_time(cutoff_idx)
                 recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
@@ -8755,14 +9022,18 @@ def __router_main__():
 def __editor_autoargs__():
     import sys
     if len(sys.argv) == 1:  # no flags -> inject defaults
+        defaults = EDITOR_AUTORUN_DEFAULTS
         sys.argv += [
-            "-t", "1m", "-l", "600",
+            "-t", defaults.timeframe,
+            "-l", str(defaults.candle_limit),
+            "--max-symbols", str(defaults.max_symbols),
+            "--recent", str(defaults.recent_bars),
             "--min-change", "5",
             "--min-volume", "30000000",
-            "--max-scan", "60",
+            "--max-scan", str(min(defaults.max_symbols, 60)),
             "--exclude-patterns", "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME",
             "--exclude-symbols", "OGUSDT,SHIBUSDT,PEPEUSDT,BONKUSDT",
-            "--verbose"
+            "--verbose",
         ]
 
 # ========================= Arabic Console Renderer & CLI (Futures-only) =========================
@@ -9027,7 +9298,7 @@ def _parse_args_android():
     p.add_argument("--tg", action="store_true", default=False)
     p.add_argument("--symbol", "-s", default="")
     p.add_argument("--verbose", "-v", action="store_true", default=False)
-    p.add_argument("--recent", type=int, default=5)
+    p.add_argument("--recent", type=int, default=2)
     p.add_argument("--drop-last", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--show-hl", action="store_true", default=False)
@@ -9181,6 +9452,15 @@ def _android_cli_entry() -> int:
             runtime.process([{"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')} for c in candles])
         except Exception as e:
             print(f"[{i}/{len(symbols)}] {sym}: error {e}", file=sys.stderr)
+            continue
+
+        metrics = runtime.gather_console_metrics()
+        latest_events = metrics.get("latest_events") or {}
+        recent_hits, recent_times = _collect_recent_event_hits(
+            runtime.series, latest_events, bars=2
+        )
+        if not recent_hits:
+            print(f"[{i}/{len(symbols)}] تخطي {sym} لعدم وجود أحداث خلال آخر شمعتين")
             continue
 
         recent_alerts = list(getattr(runtime, "alerts", []))

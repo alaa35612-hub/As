@@ -8440,6 +8440,7 @@ def scan_binance(
     min_rise_percent = float(min_rise_percent or 0.0)
     rise_timeframe = (rise_timeframe or timeframe or "").strip()
 
+    eligible_symbols: List[Tuple[str, List[Any], Optional[float], Optional[float]]] = []
     for idx, symbol in enumerate(all_symbols):
         try:
             ticker = exchange.fetch_ticker(symbol)
@@ -8504,6 +8505,9 @@ def scan_binance(
                         threshold=min_rise_percent,
                     )
                 continue
+        eligible_symbols.append((symbol, candles, daily_change, rise_change))
+
+    for idx, (symbol, candles, daily_change, rise_change) in enumerate(eligible_symbols, 1):
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
@@ -9374,6 +9378,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     ex = _build_exchange(cfg.market)
     alerts_total = 0
     symbols = symbols[:int(cfg.max_scan)]
+    eligible: List[Tuple[str, List[Any], Optional[float]]] = []
     for i, sym in enumerate(symbols, 1):
         rise_change: Optional[float] = None
         try:
@@ -9406,6 +9411,18 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                         f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم تحقيق ارتفاع {rise_min:.2f}% خلال آخر {rise_bars_req} شموع {tf_display}",
                     )
                     continue
+            eligible.append((sym, candles, rise_change))
+        except Exception as e:
+            if args.debug:
+                print(
+                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
+                    file=sys.stderr,
+                )
+            continue
+
+    eligible_total = len(eligible)
+    for j, (sym, candles, rise_change) in enumerate(eligible, 1):
+        try:
             runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
             runtime._bos_break_source = cfg.bos_confirmation
             runtime._strict_close_for_break = cfg.strict_close_for_break
@@ -9413,7 +9430,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         except Exception as e:
             if args.debug:
                 print(
-                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
+                    f"[{j}/{eligible_total}] {_format_symbol(sym)}: error {e}",
                     file=sys.stderr,
                 )
             continue
@@ -9427,7 +9444,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         )
         if not recent_hits:
             print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
+                f"[{j}/{eligible_total}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
             )
             continue
 
@@ -9486,7 +9503,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             alerts_total += len(recent_alerts)
 
     if args.verbose:
-        print(f"\nDone. Symbols scanned: {len(symbols)}, alerts: {alerts_total}")
+        print(f"\nDone. Symbols scanned: {eligible_total}, alerts: {alerts_total}")
     return 0
 
 
@@ -9587,7 +9604,7 @@ def _android_cli_entry() -> int:
             alerts_total += len(recent_alerts)
 
     if args.verbose:
-        print(f"\nDone. Symbols scanned: {len(symbols)}, alerts: {alerts_total}")
+        print(f"\nDone. Symbols scanned: {eligible_total}, alerts: {alerts_total}")
     return 0
 
 def __router_main__():

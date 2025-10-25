@@ -9210,12 +9210,16 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     pct = _fetch_pct_change(exchange, symbol)
     pct_s = f"{pct:+.2f}%" if pct is not None else "—"
 
+    metrics = runtime.gather_console_metrics()
+
     hdr = f"{_format_symbol(symbol)} ({timeframe}) تحليل"
     print(f"\n===== {hdr} =====")
-    print(f"عدد الشموع: {ln}  |  السعر الحالي: {_ar_num(last_close) if last_close is not None else '—'}  |  تغيّر 24 ساعة: {pct_s}")
+
 
     counts = _count_by_keywords(recent_alerts)
-    def c(k): return counts.get(k, 0)
+
+    def c(key: str) -> int:
+        return counts.get(key, 0)
 
     print("\nعدد التنبيهات :", len(recent_alerts))
     print("إشارات Pullback :", c("PULLBACK"))
@@ -9263,7 +9267,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         else:
             numeric_price = price if isinstance(price, (int, float)) else None
             price_str = format_price(numeric_price)
-        extras: List[str] = []
+        extras: list[str] = []
         status_display = event.get("status_display")
         if status_display:
             extras.append(str(status_display))
@@ -9285,33 +9289,40 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     _print_event_line("FVG_UP", "فجوة FVG صاعدة")
     _print_event_line("FVG_DN", "فجوة FVG هابطة")
 
+
     print("\nأحدث الإشارات مع الأسعار")
     if not recent_alerts:
         print("—")
     else:
-        # Latest per logic bucket
-        latest = _extract_latest_from_runtime(runtime)
         for name in _LAST_BUCKETS.keys():
             item = latest.get(name)
             if not item:
                 continue
             ts, title = item
             try:
-                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
+                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts / 1000)) if ts else "—"
             except Exception:
                 ts_s = "—"
             colored_title = _colorize_directional_text(title)
             print(f"- {name}: {ts_s} UTC  |  {colored_title}")
+
+
+def _android_cli_entry() -> int:
+    """Android/embedded scanner entry point using the shared scan pipeline."""
+
     if ccxt is None:
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
+
     cfg, args = _parse_args_android()
     recent_window = max(1, args.recent)
 
-    # Build symbols first with strong filters
-    symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
+    symbols = _pick_symbols(
+        cfg,
+        symbol_override=(args.symbol or None),
+        max_symbols_hint=args.max_symbols,
+    )
 
-    # Construct indicator inputs (no changes to core logic)
     try:
         (
             SmartMoneyAlgoProE5,
@@ -9326,20 +9337,24 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             StructureInputs,
             ICTMarketStructureInputs,
             fetch_ohlcv,
-            _parse_timeframe_to_seconds,
         )
-    except NameError as e:
-        print("Missing core symbol in indicator:", e, file=sys.stderr)
+    except NameError as exc:
+        print("Missing core symbol in indicator:", exc, file=sys.stderr)
         return 3
 
     pullback = PullbackInputs(showHL=cfg.showHL, showMn=cfg.showMn)
-    structure = MarketStructureInputs(showSMC=cfg.showSMC, lengSMC=int(cfg.lengSMC), showCircleHL=cfg.showCircleHL)
+    structure = MarketStructureInputs(
+        showSMC=cfg.showSMC,
+        lengSMC=int(cfg.lengSMC),
+        showCircleHL=cfg.showCircleHL,
+    )
     order_flow = OrderFlowInputs(showISOB=cfg.showISOB, showMajoinMiner=cfg.showMajoinMiner)
     fvg = FVGInputs(show_fvg=cfg.show_fvg)
     liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
-    ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)  # canonicalized inside
-    ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=not args.no_ote, markX=not args.no_mark_x)
+    demand_supply = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)
+    order_block = OrderBlockInputs(poi_type=cfg.zone_type)
+    structure_utils = StructureInputs(isOTE=not args.no_ote, markX=not args.no_mark_x)
+    ict_structure = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
 
     inputs = IndicatorInputs(
         pullback=pullback,
@@ -9347,69 +9362,82 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         order_flow=order_flow,
         fvg=fvg,
         liquidity=liq,
-        demand_supply=ds,
-        order_block=ob,
-        structure_util=utils,
-        ict_structure=ICTMarketStructureInputs(swingSize=int(cfg.swing_size)),
+        demand_supply=demand_supply,
+        order_block=order_block,
+        structure_util=structure_utils,
+        ict_structure=ict_structure,
     )
 
-    # Run loop
-    ex = _build_exchange(cfg.market)
-    alerts_total = 0
-    symbols = symbols[:int(cfg.max_scan)]
-    eligible: List[Tuple[str, List[Any], Optional[float]]] = []
-    for i, sym in enumerate(symbols, 1):
+    inputs.console.max_age_bars = max(1, recent_window - 1)
+
+    exchange = _build_exchange(cfg.market)
+    symbols = symbols[: int(cfg.max_scan)]
+
+    eligible: list[tuple[str, list[Any], Optional[float]]] = []
+    for idx, symbol in enumerate(symbols, 1):
         rise_change: Optional[float] = None
         try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
+            candles = fetch_ohlcv(exchange, symbol, args.timeframe, args.limit)
             if cfg.drop_last_incomplete and candles:
                 candles = candles[:-1]
-            rise_min = cfg.rise_min_percent
-            rise_bars_req = max(0, cfg.rise_bars)
+
+            rise_threshold = cfg.rise_min_percent
+            rise_bars = max(0, cfg.rise_bars)
             rise_tf = (cfg.rise_timeframe or args.timeframe or "").strip()
-            if rise_min > 0 and rise_bars_req > 0:
+
+            if rise_threshold > 0 and rise_bars > 0:
                 try:
                     if rise_tf and rise_tf == args.timeframe:
-                        window = candles[-max(2, min(len(candles), rise_bars_req)) :]
+                        window = candles[-max(2, min(len(candles), rise_bars)) :]
                     else:
-                        window = fetch_ohlcv(ex, sym, rise_tf or args.timeframe, max(rise_bars_req, 2))
+                        window = fetch_ohlcv(
+                            exchange,
+                            symbol,
+                            rise_tf or args.timeframe,
+                            max(rise_bars, 2),
+                        )
                 except Exception as exc:
                     print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} بسبب فشل تحميل بيانات الارتفاع ({exc})",
+                        f"[{idx}/{len(symbols)}] تخطي {_format_symbol(symbol)} بسبب فشل تحميل بيانات الارتفاع ({exc})",
                         file=sys.stderr,
                     )
                     continue
+
                 if window:
-                    slice_len = max(2, min(len(window), rise_bars_req))
+                    slice_len = max(2, min(len(window), rise_bars))
                     rise_change = _percent_change_from_series(window[-slice_len:])
                 else:
                     rise_change = None
-                if rise_change is None or rise_change < rise_min:
+
+                if rise_change is None or rise_change < rise_threshold:
                     tf_display = rise_tf or args.timeframe
                     print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم تحقيق ارتفاع {rise_min:.2f}% خلال آخر {rise_bars_req} شموع {tf_display}",
+                        f"[{idx}/{len(symbols)}] تخطي {_format_symbol(symbol)} لعدم تحقيق ارتفاع {rise_threshold:.2f}% خلال آخر {rise_bars} شموع {tf_display}",
                     )
                     continue
-            eligible.append((sym, candles, rise_change))
-        except Exception as e:
+
+            eligible.append((symbol, candles, rise_change))
+        except Exception as exc:
             if args.debug:
                 print(
-                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
+                    f"[{idx}/{len(symbols)}] {_format_symbol(symbol)}: error {exc}",
                     file=sys.stderr,
                 )
             continue
 
     eligible_total = len(eligible)
-    for j, (sym, candles, rise_change) in enumerate(eligible, 1):
+    alerts_total = 0
+
+    for pos, (symbol, candles, rise_change) in enumerate(eligible, 1):
         try:
             runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
             runtime._bos_break_source = cfg.bos_confirmation
             runtime._strict_close_for_break = cfg.strict_close_for_break
             runtime.process(candles)
-        except Exception as e:
+        except Exception as exc:
             if args.debug:
                 print(
-                    f"[{j}/{eligible_total}] {_format_symbol(sym)}: error {e}",
+                    f"[{pos}/{eligible_total}] {_format_symbol(symbol)}: error {exc}",
                     file=sys.stderr,
                 )
             continue
@@ -9417,13 +9445,15 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         metrics = runtime.gather_console_metrics()
         if rise_change is not None:
             metrics["rise_change_percent"] = rise_change
-        latest = metrics.get("latest_events", {})
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest, bars=recent_window
+        latest_events = metrics.get("latest_events", {})
+        recent_hits, _recent_times = _collect_recent_event_hits(
+            runtime.series,
+            latest_events,
+            bars=recent_window,
         )
         if not recent_hits:
             print(
-                f"[{j}/{eligible_total}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
+                f"[{pos}/{eligible_total}] تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {recent_window} شموع",
             )
             continue
 
@@ -9433,200 +9463,54 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             cutoff_time = runtime.series.get_time(cutoff_idx)
             recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
 
-        summary = []
-        for key in ["BOS","BOS_PLUS","CHOCH","IDM","IDM_OB","EXT_OB","GOLDEN_ZONE"]:
-            if key in latest:
-                evt = latest[key]
-                disp = evt.get("display", "")
-                status_disp = evt.get("status_display")
-                if status_disp:
-                    disp = f"{disp} [{status_disp}]"
-                direction_hint = _resolve_direction(
-                    evt.get("direction"),
-                    evt.get("direction_display"),
-                    evt.get("status"),
-                    evt.get("text"),
-                    disp,
-                )
-                summary.append(
-                    _colorize_directional_text(
-                        disp,
-                        direction=direction_hint,
-                        fallback=None,
-                    )
-                )
+        summary: list[str] = []
+        for key in ["BOS", "BOS_PLUS", "CHOCH", "IDM", "IDM_OB", "EXT_OB", "GOLDEN_ZONE"]:
+            evt = latest_events.get(key)
+            if not isinstance(evt, dict):
+                continue
+            display = evt.get("display", "")
+            status_display = evt.get("status_display")
+            if status_display:
+                display = f"{display} [{status_display}]"
+            direction_hint = _resolve_direction(
+                evt.get("direction"),
+                evt.get("direction_display"),
+                evt.get("status"),
+                evt.get("text"),
+                display,
+            )
+            summary.append(
+                _colorize_directional_text(display, direction=direction_hint, fallback=None)
+            )
 
         triggers = _detect_new_formations_and_touches(
             runtime,
             args.timeframe,
             cfg.formation_lookback,
-            symbol=_format_symbol(sym),
+            symbol=_format_symbol(symbol),
         )
         if cfg.tg_enable and triggers:
             try:
-                _send_tg(cfg, [f"{cfg.tg_title_prefix} :: {_format_symbol(sym)}"] + triggers)
+                _send_tg(cfg, [f"{cfg.tg_title_prefix} :: {_format_symbol(symbol)}"] + triggers)
             except Exception:
                 if args.debug:
                     print("فشل إرسال تنبيه تيليجرام", file=sys.stderr)
 
         if recent_alerts or args.verbose:
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
+            _print_ar_report(symbol, args.timeframe, runtime, exchange, recent_alerts)
             if summary:
                 print("  •", " | ".join(summary))
             for trig in triggers:
                 print("  →", trig)
             for ts, title in recent_alerts[-10:]:
-                ts_s = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts/1000))
+                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts / 1000))
                 colored_title = _colorize_directional_text(title)
                 print(f"  - {ts_s} :: {colored_title}")
             alerts_total += len(recent_alerts)
 
     if args.verbose:
         print(f"\nDone. Symbols scanned: {eligible_total}, alerts: {alerts_total}")
-    return 0
 
-
-
-def _android_cli_entry() -> int:
-    # Android CLI entry: futures-only live scan with Arabic renderer
-    if ccxt is None:
-        print("ccxt not installed. pip install ccxt", file=sys.stderr)
-        return 2
-    cfg, args = _parse_args_android()
-
-    # Build symbols first with strong filters
-    symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
-
-    # Core indicator types must exist in the merged file
-    try:
-        SmartMoneyAlgoProE5
-        IndicatorInputs
-        PullbackInputs
-        MarketStructureInputs
-        OrderFlowInputs
-        FVGInputs
-        LiquidityInputs
-        DemandSupplyInputs
-        OrderBlockInputs
-        StructureInputs
-        ICTMarketStructureInputs
-        fetch_ohlcv
-    except NameError as e:
-        print("Missing core symbol in indicator:", e, file=sys.stderr)
-        return 3
-
-    pullback = PullbackInputs(showHL=cfg.showHL, showMn=cfg.showMn)
-    structure = MarketStructureInputs(showSMC=cfg.showSMC, lengSMC=int(cfg.lengSMC), showCircleHL=cfg.showCircleHL)
-    order_flow = OrderFlowInputs(showISOB=cfg.showISOB, showMajoinMiner=cfg.showMajoinMiner)
-    fvg = FVGInputs(show_fvg=cfg.show_fvg)
-    liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
-    ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)
-    ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=not args.no_ote, markX=not args.no_mark_x)
-    ict = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
-
-    inputs = IndicatorInputs(
-        pullback=pullback,
-        structure=structure,
-        order_flow=order_flow,
-        fvg=fvg,
-        liquidity=liq,
-        demand_supply=ds,
-        order_block=ob,
-        structure_util=utils,
-        ict_structure=ict,
-    )
-    inputs.console.max_age_bars = max(1, recent_window - 1)
-
-    ex = _build_exchange(cfg.market)
-    alerts_total = 0
-    symbols = symbols[:int(cfg.max_scan)]
-    eligible: List[Tuple[str, List[Any], Optional[float]]] = []
-
-    for i, sym in enumerate(symbols, 1):
-        rise_change: Optional[float] = None
-        try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-            if cfg.drop_last_incomplete and candles:
-                candles = candles[:-1]
-            rise_min = cfg.rise_min_percent
-            rise_bars_req = max(0, cfg.rise_bars)
-            rise_tf = (cfg.rise_timeframe or args.timeframe or "").strip()
-            if rise_min > 0 and rise_bars_req > 0:
-                try:
-                    if rise_tf and rise_tf == args.timeframe:
-                        window = candles[-max(2, min(len(candles), rise_bars_req)) :]
-                    else:
-                        window = fetch_ohlcv(ex, sym, rise_tf or args.timeframe, max(rise_bars_req, 2))
-                except Exception as exc:
-                    print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} بسبب فشل تحميل بيانات الارتفاع ({exc})",
-                        file=sys.stderr,
-                    )
-                    continue
-                if window:
-                    slice_len = max(2, min(len(window), rise_bars_req))
-                    rise_change = _percent_change_from_series(window[-slice_len:])
-                else:
-                    rise_change = None
-                if rise_change is None or rise_change < rise_min:
-                    tf_display = rise_tf or args.timeframe
-                    print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم تحقيق ارتفاع {rise_min:.2f}% خلال آخر {rise_bars_req} شموع {tf_display}",
-                    )
-                    continue
-            eligible.append((sym, candles, rise_change))
-        except Exception as e:
-            if args.debug:
-                print(
-                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                    file=sys.stderr,
-                )
-            continue
-
-    eligible_total = len(eligible)
-    for j, (sym, candles, rise_change) in enumerate(eligible, 1):
-        try:
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-            runtime._bos_break_source = cfg.bos_confirmation
-            runtime._strict_close_for_break = cfg.strict_close_for_break
-            runtime.process(candles)
-        except Exception as e:
-            if args.debug:
-                print(
-                    f"[{j}/{eligible_total}] {_format_symbol(sym)}: error {e}",
-                    file=sys.stderr,
-                )
-            continue
-
-        metrics = runtime.gather_console_metrics()
-        if rise_change is not None:
-            metrics["rise_change_percent"] = rise_change
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=recent_window
-        )
-        if not recent_hits:
-            print(
-                f"[{j}/{eligible_total}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
-            )
-            continue
-
-        recent_alerts = list(runtime.alerts)
-        if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
-            cutoff_idx = max(0, runtime.series.length() - recent_window)
-            try:
-                cutoff_time = runtime.series.get_time(cutoff_idx)
-                recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
-            except Exception:
-                pass
-
-        if recent_alerts or args.verbose:
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-            alerts_total += len(recent_alerts)
-
-    if args.verbose:
-        print(f"\nDone. Symbols scanned: {eligible_total}, alerts: {alerts_total}")
     return 0
 
 def __router_main__():
